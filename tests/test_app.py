@@ -589,3 +589,28 @@ class TestOnASerialPort:
         watcher.stop()
         assert code == 0
         assert len(list(out.glob("*.jpg"))) == 1
+
+
+# ----- confirming the patient --------------------------------------------------------------
+
+def test_confirmation_shows_who_was_found_and_ignores_a_held_enter_key(qapp):
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QLabel
+
+    from tsm300.app import PatientConfirm
+
+    dialog = PatientConfirm(None, LEE, date(2026, 11, 26))
+    _OPENED.append(dialog)
+    dialog.show()
+    assert QTest.qWaitForWindowExposed(dialog)
+
+    shown = [label.text() for label in dialog.findChildren(QLabel)]
+    assert shown == ["이 환자가 맞습니까?", "이두리", "차트번호 67890", "1975-06-15 · 남 51세"]
+
+    held = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier, "\r", True)
+    QApplication.sendEvent(dialog, held)
+    assert dialog.isVisible()
+
+    QTest.keyClick(dialog, Qt.Key.Key_Return)
+    assert not dialog.isVisible() and dialog.result() == PatientConfirm.DialogCode.Accepted

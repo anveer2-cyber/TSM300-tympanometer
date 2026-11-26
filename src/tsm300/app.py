@@ -161,6 +161,11 @@ class PatientConfirm(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def keyPressEvent(self, event) -> None:
+        # An Enter still held down from the chart number box must not answer the question by itself.
+        if not event.isAutoRepeat():
+            super().keyPressEvent(event)
+
 
 class SettingsDialog(QDialog):
     """Where patients are looked up and where result sheets are sent."""
