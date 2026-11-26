@@ -3,13 +3,13 @@
 import io
 import json
 import os
-import struct
 import threading
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 import serial
+from PIL import Image
 
 from tsm300 import cli, listen
 from tsm300.console import Console, open_port
@@ -23,33 +23,29 @@ POWER_ON = (DATA / "power_on.bin").read_bytes()
 WHEN = datetime(2026, 11, 26, 21, 12, 5)
 
 
-def png_size(path):
-    data = path.read_bytes()
-    assert data[:8] == b"\x89PNG\r\n\x1a\n"
-    return struct.unpack(">II", data[16:24])
-
-
 def make_listener(tmp_path, **options):
     out = io.StringIO()
     listener = listen.Listener(Console(out=out), tmp_path / "results", now=lambda: WHEN, **options)
     return listener, out
 
 
-def test_a_measurement_is_saved_as_raw_bytes_values_and_picture(tmp_path):
+def test_a_measurement_is_saved_as_raw_bytes_values_and_sheet(tmp_path):
     listener, out = make_listener(tmp_path)
 
     listener.handle([parse_message(BOTH)])
 
     results = tmp_path / "results"
     assert sorted(path.name for path in results.iterdir()) == [
-        "20261126_211205.bin", "20261126_211205.json", "20261126_211205.png",
+        "20261126_211205.bin", "20261126_211205.jpg", "20261126_211205.json",
     ]
     assert (results / "20261126_211205.bin").read_bytes() == BOTH
-    assert png_size(results / "20261126_211205.png") == (1800, 1200)
-    assert listener.saved == [results / "20261126_211205.png"]
+    with Image.open(results / "20261126_211205.jpg") as sheet:
+        assert sheet.format == "JPEG" and sheet.size == (2480, 3508)
+    assert listener.saved == [results / "20261126_211205.jpg"]
 
     saved = json.loads((results / "20261126_211205.json").read_text(encoding="utf-8"))
     assert saved["received_at"] == "2026-11-26T21:12:05"
+    assert saved["patient"] == {"chart_no": "", "name": "", "sex": "", "birth_date": None}
     assert saved["device"] == {"name": "TSM-300", "code": "6349"}
     assert saved["memory_id"] == 1
     right = saved["right"]
@@ -96,22 +92,40 @@ def test_two_results_in_the_same_second_do_not_overwrite_each_other(tmp_path):
     assert names == ["20261126_211205.json", "20261126_211205_2.json"]
 
 
-def test_show_opens_the_saved_picture(tmp_path, monkeypatch):
+def test_show_opens_the_saved_sheet(tmp_path, monkeypatch):
     opened = []
-    monkeypatch.setattr(listen, "_open_file", opened.append)
+    monkeypatch.setattr(listen, "open_file", opened.append)
     listener, _ = make_listener(tmp_path, show=True)
 
     listener.handle([parse_message(BOTH)])
 
-    assert opened == [tmp_path / "results" / "20261126_211205.png"]
+    assert opened == [tmp_path / "results" / "20261126_211205.jpg"]
 
 
 def test_decode_command_turns_saved_raw_files_into_results(tmp_path, capsys):
     code = cli.main(["decode", str(DATA / "left_only.bin"), "--out", str(tmp_path)])
 
     assert code == 0
-    assert len(list(tmp_path.glob("*.png"))) == 1
+    assert len(list(tmp_path.glob("*.jpg"))) == 1
     assert "왼쪽: 압력 0 daPa, 용적 9.30 ml" in capsys.readouterr().out
+
+
+def test_decode_command_attaches_the_given_patient(tmp_path):
+    code = cli.main(["decode", str(DATA / "left_only.bin"), "--out", str(tmp_path),
+                     "--chart", "12345", "--name", "홍길동", "--sex", "m", "--birth", "19800131"])
+
+    assert code == 0
+    (saved,) = tmp_path.glob("*_12345.json")
+    assert saved.with_suffix(".jpg").exists()
+    patient = json.loads(saved.read_text(encoding="utf-8"))["patient"]
+    assert patient == {"chart_no": "12345", "name": "홍길동", "sex": "남", "birth_date": "1980-01-31"}
+
+
+def test_decode_command_rejects_an_unreadable_birth_date(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["decode", str(DATA / "left_only.bin"), "--out", str(tmp_path), "--birth", "1980-13-45"])
+    assert "없는 날짜입니다" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == []
 
 
 class TestOnASerialPort:
@@ -178,7 +192,7 @@ class TestOnASerialPort:
                 pass
 
         out = io.StringIO()
-        args = cli.build_parser().parse_args(["--port", "COM5", "--out", str(tmp_path / "results")])
+        args = cli.build_parser().parse_args(["listen", "--port", "COM5", "--out", str(tmp_path / "results")])
         code = listen.run(
             args, Console(out=out),
             port_opener=lambda port, baud: Unplugged() if opener(port, baud) else None,
@@ -192,4 +206,4 @@ class TestOnASerialPort:
         assert "검사 수신 (ID 1)" in text
         assert "포트 연결이 끊겼습니다: device removed" in text
         assert "종료합니다" in text
-        assert len(list((tmp_path / "results").glob("*.png"))) == 1
+        assert len(list((tmp_path / "results").glob("*.jpg"))) == 1

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import time
 import webbrowser
@@ -14,8 +13,10 @@ import serial
 
 from . import __version__
 from .console import Console, choose_port, open_port
-from .protocol import Corrupt, EarResult, Measurement, PowerOn, StreamDecoder, tympanogram_pressures
-from .render import prepare, render
+from .patient import Patient
+from .protocol import Corrupt, EarResult, Measurement, PowerOn, StreamDecoder
+from .report import prepare
+from .store import free_stem, save_result
 
 STALE_AFTER = 3.0
 RETRY_AFTER = 5.0
@@ -28,28 +29,6 @@ READY = """\
 """
 
 
-def measurement_to_dict(measurement: Measurement, received_at: datetime) -> dict:
-    return {
-        "received_at": received_at.isoformat(timespec="seconds"),
-        "device": {"name": measurement.device_name, "code": measurement.device_code},
-        "memory_id": measurement.memory_id,
-        "right": _ear_to_dict(measurement.right),
-        "left": _ear_to_dict(measurement.left),
-    }
-
-
-def save_measurement(measurement: Measurement, directory: Path, received_at: datetime) -> Path:
-    """Writes the raw message, the decoded values and the picture. Returns the picture's path."""
-    directory.mkdir(parents=True, exist_ok=True)
-    stem = _free_stem(directory, received_at.strftime("%Y%m%d_%H%M%S"))
-    (directory / f"{stem}.bin").write_bytes(measurement.raw)
-    text = json.dumps(measurement_to_dict(measurement, received_at), ensure_ascii=False, indent=2)
-    (directory / f"{stem}.json").write_text(text, encoding="utf-8")
-    picture = directory / f"{stem}.png"
-    render(measurement, picture, received_at)
-    return picture
-
-
 def describe_ear(name: str, ear: EarResult | None) -> str:
     if ear is None:
         return f"  {name}: 측정 없음"
@@ -60,28 +39,36 @@ def describe_ear(name: str, ear: EarResult | None) -> str:
     )
 
 
+def read_events(ser, stop: Callable[[], bool] = lambda: False,
+                clock: Callable[[], float] = time.monotonic):
+    """Yields Measurement, PowerOn and Corrupt events from the port until ``stop()`` is true."""
+    decoder = StreamDecoder()
+    last_data = clock()
+    while not stop():
+        data = ser.read(ser.in_waiting or 1)
+        if data:
+            last_data = clock()
+            yield from decoder.feed(data)
+        elif decoder.pending and clock() - last_data > STALE_AFTER:
+            yield from decoder.flush()
+
+
 class Listener:
     """Feeds received bytes to the decoder and acts on what comes out."""
 
     def __init__(self, console: Console, directory: Path, show: bool = False,
-                 now: Callable[[], datetime] = datetime.now) -> None:
+                 now: Callable[[], datetime] = datetime.now, patient: Patient = Patient()) -> None:
         self.saved: list[Path] = []
         self._console = console
         self._directory = directory
         self._show = show
         self._now = now
-        self._decoder = StreamDecoder()
+        self._patient = patient
 
     def run(self, ser, stop: Callable[[], bool] = lambda: False,
             clock: Callable[[], float] = time.monotonic) -> None:
-        last_data = clock()
-        while not stop():
-            data = ser.read(ser.in_waiting or 1)
-            if data:
-                last_data = clock()
-                self.handle(self._decoder.feed(data))
-            elif self._decoder.pending and clock() - last_data > STALE_AFTER:
-                self.handle(self._decoder.flush())
+        for event in read_events(ser, stop, clock):
+            self.handle([event])
 
     def handle(self, events: list) -> None:
         for event in events:
@@ -102,16 +89,16 @@ class Listener:
         self._console.say(describe_ear("왼쪽", measurement.left))
         if measurement.unknown:
             self._console.say(f"  알 수 없는 항목: {', '.join(sorted(measurement.unknown))}")
-        picture = save_measurement(measurement, self._directory, received_at)
-        self.saved.append(picture)
-        self._console.say(f"  저장: {picture.resolve()}")
+        sheet = save_result(measurement, self._directory, received_at, self._patient)
+        self.saved.append(sheet)
+        self._console.say(f"  저장: {sheet.resolve()}")
         if self._show:
-            _open_file(picture)
+            open_file(sheet)
 
     def _corrupt(self, event: Corrupt) -> None:
         received_at = self._now()
         self._directory.mkdir(parents=True, exist_ok=True)
-        stem = _free_stem(self._directory, received_at.strftime("corrupt_%Y%m%d_%H%M%S"))
+        stem = free_stem(self._directory, received_at.strftime("corrupt_%Y%m%d_%H%M%S"))
         (self._directory / f"{stem}.bin").write_bytes(event.data)
         self._console.say(f"\n[{received_at:%H:%M:%S}] 전송을 해독하지 못했습니다 ({event.reason}).")
         self._console.say("  장비에서 -> 키를 다시 눌러 주세요.")
@@ -148,10 +135,10 @@ def run(args, console: Console, port_opener=open_port, sleep: Callable[[float], 
     return 0
 
 
-def decode_files(paths: list[str], directory: Path, console: Console,
+def decode_files(paths: list[str], directory: Path, console: Console, patient: Patient = Patient(),
                  now: Callable[[], datetime] = datetime.now) -> int:
     """Decodes saved raw transmissions, as if the device had just sent them."""
-    listener = Listener(console, directory, now=now)
+    listener = Listener(console, directory, now=now, patient=patient)
     for path in paths:
         console.say(f"\n{path}")
         decoder = StreamDecoder()
@@ -162,35 +149,7 @@ def decode_files(paths: list[str], directory: Path, console: Console,
     return 0
 
 
-def _ear_to_dict(ear: EarResult | None) -> dict | None:
-    if ear is None:
-        return None
-    return {
-        "middle_ear_pressure_dapa": ear.middle_ear_pressure,
-        "ear_volume_ml": ear.ear_volume,
-        "compliance_ml": ear.compliance,
-        "width_dapa": ear.width,
-        "tympanogram": {
-            "pressure_dapa": tympanogram_pressures(),
-            "compliance_ml": [round(value, 4) for value in ear.compliance_curve],
-        },
-        "reflex_ml": {
-            str(frequency): [round(value, 4) for value in ear.reflex_curve(frequency)]
-            for frequency in sorted(ear.reflexes)
-        },
-    }
-
-
-def _free_stem(directory: Path, stem: str) -> str:
-    """Returns ``stem``, or ``stem_2``, ``stem_3``... when files with that name already exist."""
-    candidate, number = stem, 1
-    while any(directory.glob(f"{candidate}.*")):
-        number += 1
-        candidate = f"{stem}_{number}"
-    return candidate
-
-
-def _open_file(path: Path) -> None:
+def open_file(path: Path) -> None:
     if hasattr(os, "startfile"):
         os.startfile(path)
     else:
