@@ -19,7 +19,8 @@ from .protocol import (
 SURFACE = "#ffffff"
 INK = "#191919"
 INK_SECONDARY = "#666666"
-GRIDLINE = "#e7e7e7"
+GRIDLINE = "#a6a6a6"
+GRID_DOTS = (0, (1, 3))
 AXIS = "#c2c2c2"
 RIGHT_EAR = "#ec4647"
 LEFT_EAR = "#257de0"
@@ -121,7 +122,7 @@ def _draw_tympanogram(axes, ear: EarResult, color: str, labels: dict) -> None:
     axes.set_ylim(-0.5, top)
     axes.set_xticks(range(-300, 201, 100))
     axes.set_yticks(range(0, int(top) + 1))
-    _style_axes(axes)
+    _style_axes(axes, grid="both")
     axes.axhline(0, color=AXIS, linewidth=1, zorder=1)
     (left, right), (bottom, upper) = NORMAL_PRESSURE, NORMAL_COMPLIANCE
     axes.add_patch(Rectangle(
@@ -176,9 +177,9 @@ def _draw_reflexes(figure: Figure, cell, ear: EarResult, color: str) -> None:
                       zorder=3, clip_on=False)
 
 
-def _style_axes(axes) -> None:
+def _style_axes(axes, grid: str = "y") -> None:
     axes.set_facecolor(SURFACE)
-    axes.grid(True, axis="y", color=GRIDLINE, linewidth=1, linestyle="-")
+    axes.grid(True, axis=grid, color=GRIDLINE, linewidth=1, linestyle=GRID_DOTS)
     axes.set_axisbelow(True)
     for side in ("top", "right", "left"):
         axes.spines[side].set_visible(False)
