@@ -614,3 +614,27 @@ def test_confirmation_shows_who_was_found_and_ignores_a_held_enter_key(qapp):
 
     QTest.keyClick(dialog, Qt.Key.Key_Return)
     assert not dialog.isVisible() and dialog.result() == PatientConfirm.DialogCode.Accepted
+
+
+# ----- unexpected errors -------------------------------------------------------------------
+
+def test_unexpected_errors_are_logged_and_shown_when_there_is_no_console(qapp, tmp_path, monkeypatch):
+    import sys
+
+    from PySide6.QtWidgets import QMessageBox
+
+    from tsm300.app import report_crashes
+
+    shown = []
+    monkeypatch.setattr(QMessageBox, "critical", lambda parent, title, text: shown.append(text))
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    report_crashes(tmp_path / "settings")
+
+    try:
+        raise ValueError("깨진 결과")
+    except ValueError:
+        sys.excepthook(*sys.exc_info())
+
+    log = (tmp_path / "settings" / "error.log").read_text(encoding="utf-8")
+    assert "ValueError: 깨진 결과" in log and "Traceback" in log
+    assert "깨진 결과" in shown[0] and "error.log" in shown[0]

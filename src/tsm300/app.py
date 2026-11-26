@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import traceback
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -11,7 +12,7 @@ from typing import Callable
 
 import serial
 from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QSizePolicy,
@@ -27,6 +28,7 @@ from .protocol import Corrupt, Measurement, PowerOn
 from .records import Records, charts_tested_on, records_from_settings, send_sheet
 from .report import prepare
 from .settings import Settings
+from .shortcut import ICON, claim_taskbar_identity
 from .store import delete_result, save_result
 
 NO_SOURCE_NOTE = "차트번호 조회와 오늘 검사 오더 목록은 [설정]에서 환자 조회를 연결하면 쓸 수 있습니다. 지금은 직접 입력해 주세요."
@@ -743,8 +745,37 @@ class MainWindow(QMainWindow):
         return PatientConfirm(self, patient, self._now().date()).exec() == QDialog.DialogCode.Accepted
 
 
+def report_crashes(directory: Path) -> None:
+    """Writes unexpected errors to ``error.log`` and shows them; started from a shortcut there is no console."""
+
+    def hook(kind, error, trace) -> None:
+        text = "".join(traceback.format_exception(kind, error, trace))
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            with open(directory / "error.log", "a", encoding="utf-8") as log:
+                log.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} v{__version__}\n{text}\n")
+        except OSError:
+            pass
+        if QApplication.instance() is not None:
+            QMessageBox.critical(None, "TSM300 오류", f"예상하지 못한 오류가 났습니다.\n\n{error}\n\n"
+                                 f"자세한 내용은 {directory / 'error.log'} 에 적었습니다.")
+
+    sys.excepthook = hook
+
+
 def run(args) -> int:
+    claim_taskbar_identity()
     app = QApplication.instance() or QApplication(sys.argv[:1])
+    app.setWindowIcon(QIcon(str(ICON)))
+    usual_hook = sys.excepthook
+    report_crashes(settings_file.settings_directory())
+    try:
+        return _run_window(app, args)
+    finally:
+        sys.excepthook = usual_hook
+
+
+def _run_window(app: QApplication, args) -> int:
     prepare()
     settings = settings_file.load()
     window = MainWindow(Path(args.out), settings)

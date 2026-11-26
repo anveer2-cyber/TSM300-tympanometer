@@ -1,4 +1,4 @@
-"""Command line: the operator's window (the default), console listening, raw capture, ports, decoding."""
+"""Command line: the operator's window (the default), a desktop shortcut, console listening, raw capture, ports, decoding."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     listen.add_argument("--show", action="store_true", help="결과지를 받자마자 화면에 엽니다")
 
     commands.add_parser("ports", help="시리얼 포트 목록을 보여 줍니다")
+    commands.add_parser("shortcut", help="바탕 화면에 프로그램 바로가기를 만듭니다")
 
     capture = commands.add_parser("capture", help="장비가 보내는 원시 데이터를 그대로 기록합니다 (분석용)")
     _add_port_options(capture)
@@ -58,6 +59,16 @@ def main(argv: list[str] | None = None) -> int:
             console.say(f"{port.device} - {port.description} [{port.hwid}]")
         if not ports:
             console.say("시리얼 포트 없음")
+        return 0
+    if args.command == "shortcut":
+        from .shortcut import create_shortcut
+        try:
+            created = create_shortcut(Path.cwd())
+        except RuntimeError as error:
+            console.say(str(error))
+            return 1
+        console.say(f"바로가기를 만들었습니다: {created}")
+        console.say(f"바로가기로 실행하면 결과는 {Path.cwd() / 'results'} 에 저장됩니다.")
         return 0
     if args.command == "capture":
         from . import wizard
