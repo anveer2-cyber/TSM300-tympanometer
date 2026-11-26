@@ -44,6 +44,21 @@ def settings_directory() -> Path:
     return Path.home() / ".config" / "TSM300"
 
 
+def is_packaged() -> bool:
+    """True when running as the single-file program (TSM300.exe) rather than from Python."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def results_directory() -> Path:
+    """Where the window keeps results when it is not told a folder.
+
+    From Python that is ``results`` in the folder the program was started from. The packaged
+    program can be started from anywhere, a downloads folder for one, so it keeps them in a
+    fixed place beside its settings.
+    """
+    return settings_directory() / "results" if is_packaged() else Path("results")
+
+
 def load(directory: Path | None = None) -> Settings:
     """Reads the settings, falling back to the previous save when the file is damaged."""
     path = (directory or settings_directory()) / FILE_NAME

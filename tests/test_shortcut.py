@@ -9,7 +9,7 @@ import pytest
 from PIL import Image
 
 from tsm300 import cli
-from tsm300.shortcut import ICON, SHORTCUT_NAME, create_shortcut, windowless_python
+from tsm300.shortcut import ICON, SHORTCUT_NAME, create_shortcut, start_command, windowless_python
 
 ON_WINDOWS = sys.platform == "win32"
 
@@ -59,6 +59,30 @@ def test_shortcut_starts_the_program_without_a_console_from_the_chosen_folder(tm
     assert Path(link["working_directory"]) == work
     assert Path(link["icon"]) == ICON
     assert link["description"] == SHORTCUT_NAME
+
+
+def test_from_python_a_shortcut_runs_the_module_and_the_packaged_program_runs_itself(tmp_path, monkeypatch):
+    assert start_command() == (windowless_python(), "-m tsm300", ICON)
+
+    program = tmp_path / "TSM300.exe"
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(program))
+
+    assert start_command() == (program, "", program)
+
+
+@pytest.mark.skipif(not ON_WINDOWS, reason="needs the Windows shell")
+def test_shortcut_of_the_packaged_program_starts_it_directly(tmp_path, monkeypatch):
+    program = tmp_path / "TSM300.exe"
+    program.write_bytes(b"")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(program))
+
+    link = read_back(create_shortcut(tmp_path, tmp_path))
+
+    assert Path(link["target"]) == program
+    assert link["arguments"] == ""
+    assert Path(link["icon"]) == program
 
 
 @pytest.mark.skipif(not ON_WINDOWS, reason="needs the Windows shell")

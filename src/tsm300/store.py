@@ -13,6 +13,12 @@ from .report import render
 
 _SUFFIXES = (".bin", ".json", ".jpg")
 
+EXAM_KIND = "tymp"
+"""What kind of test a saved result holds, by the name 상쾌한캡처 gives it. Results of other
+tests (pure tone, speech) are meant to share the folder later; a file saved before this was
+written down holds a tympanogram."""
+FORMAT = 1
+
 
 @dataclass(frozen=True)
 class SavedResult:
@@ -30,6 +36,8 @@ class SavedResult:
 def result_to_dict(measurement: Measurement, received_at: datetime, patient: Patient,
                    note: str = "", capture: tuple[dict, ...] = ()) -> dict:
     return {
+        "format": FORMAT,
+        "exam": EXAM_KIND,
         "received_at": received_at.isoformat(timespec="seconds"),
         "patient": patient.to_dict(),
         "note": note,
@@ -60,6 +68,8 @@ def load_result(path: Path) -> SavedResult:
     sheet = path.with_suffix(".jpg")
     try:
         record = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+        if exam_of(record) != EXAM_KIND:
+            raise ValueError(f"이 프로그램이 열 수 없는 종류의 검사 결과입니다 ({exam_of(record)})")
         measurement = parse_message(path.with_suffix(".bin").read_bytes())
         received_at = datetime.fromisoformat(record["received_at"])
     except FileNotFoundError as error:
@@ -69,6 +79,11 @@ def load_result(path: Path) -> SavedResult:
     capture = tuple(entry for entry in record.get("capture") or [] if isinstance(entry, dict))
     return SavedResult(sheet, measurement, received_at, Patient.from_dict(record.get("patient") or {}),
                        str(record.get("note") or ""), capture)
+
+
+def exam_of(record: dict) -> str:
+    """The kind of test in a result's JSON record."""
+    return str(record.get("exam") or EXAM_KIND)
 
 
 def delete_result(sheet: Path) -> None:

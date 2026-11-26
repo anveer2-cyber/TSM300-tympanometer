@@ -2,7 +2,24 @@
 
 Oscilla TSM-300 임피던스 청력검사기(tympanometer)의 검사 결과를 검사 직후 PC로 가져와, 환자 정보와 함께 A4 결과지(JPG)로 저장하는 프로그램입니다.
 
-## 설치 (Windows, Python 3.9 이상)
+## 설치 (Windows)
+
+### exe 파일로 (Python 없이)
+
+[TSM300.exe 내려받기](https://github.com/anveer2-cyber/TSM300-tympanometer/releases/latest/download/TSM300.exe)
+
+내려받은 `TSM300.exe` 를 바탕 화면처럼 찾기 쉬운 곳에 두고 더블클릭합니다. 설치 과정은 없습니다.
+
+- 처음 실행할 때 "Windows의 PC 보호" 창이 뜨면 [추가 정보] → [실행]을 누릅니다. 서명하지 않은 프로그램이라 나오는 경고입니다.
+- 파일 하나에 모든 것이 들어 있어서 켜지는 데 시간이 조금 걸립니다.
+- 결과는 `%APPDATA%\TSM300\results` 에 저장됩니다. 창의 [저장 폴더 열기]로 엽니다. 다른 폴더를 쓰려면 바로가기의 대상 뒤에 `--out D:\검사결과` 처럼 적습니다.
+- 설정도 `%APPDATA%\TSM300` 에 있습니다. exe 를 새 것으로 바꾸거나 다른 폴더로 옮겨도 설정과 결과는 그대로입니다.
+- 업데이트는 새 `TSM300.exe` 를 내려받아 바꿔 넣으면 됩니다.
+- exe 는 64비트입니다. 매직차트 DB 에 직접 연결하려면 이 PC 에 64비트 ODBC 데이터 원본이 있어야 합니다. 예진이 서버를 거치면 상관없습니다.
+
+아래 설명의 `python -m tsm300` 자리에 `TSM300.exe` 를 쓰면 됩니다. exe 는 명령 프롬프트 창 없이 뜨므로, 글로 답하는 명령은 `TSM300.exe ports > ports.txt` 처럼 파일로 받아 봅니다.
+
+### Python 으로 (3.9 이상)
 
 ```bash
 python -m pip install --upgrade https://github.com/anveer2-cyber/TSM300-tympanometer/archive/refs/heads/claude/cool-hamilton-bdp178.zip
@@ -24,7 +41,7 @@ python -m tsm300
 
 창이 뜨고 USB-시리얼 포트에 자동으로 연결합니다. 포트를 직접 정하려면 `python -m tsm300 --port COM5` 로 실행합니다.
 
-### 바탕 화면 바로가기
+### 바탕 화면 바로가기 (Python 으로 설치했을 때)
 
 ```bash
 python -m tsm300 shortcut
@@ -32,7 +49,7 @@ python -m tsm300 shortcut
 
 바탕 화면에 **TSM-300 임피던스 검사** 바로가기가 생깁니다. 더블클릭하면 명령 프롬프트 창 없이 프로그램이 뜹니다. 결과는 이 명령을 실행한 폴더의 `results` 에 저장되므로, 결과를 모아 둘 폴더에서 실행해 주세요. 프로그램을 업데이트해도 바로가기는 그대로 쓸 수 있습니다.
 
-바로가기로 실행했을 때 예상하지 못한 오류가 나면 내용이 `%APPDATA%\TSM300\error.log` 에 남습니다.
+창으로 실행했을 때 예상하지 못한 오류가 나면 내용이 `%APPDATA%\TSM300\error.log` 에 남습니다. exe 도 같습니다.
 
 ### 검사 순서
 
@@ -99,7 +116,7 @@ TSM300 에서 환자를 바꿔 다시 저장하면 새 결과지가 새 환자�
 | 파일 | 내용 |
 | --- | --- |
 | `20261126_211205_00512.jpg` | A4 결과지 (300 dpi, 2480×3508). 환자 정보, 양쪽 고막운동도와 등골근 반사, 측정값 표, 메모 |
-| `20261126_211205_00512.json` | 환자 정보, 메모, 수치, 곡선 데이터, 상쾌한캡처로 보낸 기록 |
+| `20261126_211205_00512.json` | 검사 종류(`exam`: 지금은 `tymp` 뿐), 환자 정보, 메모, 수치, 곡선 데이터, 상쾌한캡처로 보낸 기록 |
 | `20261126_211205_00512.bin` | 장비가 보낸 원본 데이터 |
 
 ## 그 밖의 명령
@@ -123,5 +140,17 @@ python -m pip install -e ".[dev]"
 ```bash
 python -m pytest
 ```
+
+exe 는 Windows 에서 만듭니다.
+
+```bash
+python -m pip install . pyinstaller
+```
+
+```bash
+python tools/build_exe.py
+```
+
+`dist\TSM300.exe` 가 생깁니다. `tools\check_exe.ps1` 은 만든 exe 의 버전, 결과지 그리기, 창 뜨기를 확인합니다. GitHub 에 올리면 같은 일이 자동으로 돌고, 버전 번호(`src/tsm300/__init__.py`)가 새것이면 그 exe 가 Releases 에 올라갑니다.
 
 `tests/data` 의 파일은 실제 장비에서 받은 전송입니다. 병원 DB 와 상쾌한캡처는 테스트에서 가짜(`tests/fakes.py`)로 대신합니다. `src/tsm300/links.py` 는 병원의 VNGLive 프로그램에서 쓰는 조회와 전송 코드를 옮겨 온 것입니다. 화면 테스트는 `QT_QPA_PLATFORM=offscreen` 환경변수를 주면 화면 없이 돌아갑니다.

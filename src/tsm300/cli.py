@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 from . import __version__
+from . import settings as settings_file
 from .console import Console, available_ports
 from .patient import Patient, parse_birth_date, parse_sex
 from .protocol import BAUD_RATE
@@ -18,7 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=__version__)
     _add_port_options(parser)
-    parser.add_argument("--out", default="results", help="결과를 저장할 폴더 (기본: results)")
+    parser.add_argument("--out", help="결과를 저장할 폴더 (기본: results, exe 는 설정 폴더 안의 results)")
     commands = parser.add_subparsers(dest="command", title="그 밖의 명령")
 
     listen = commands.add_parser("listen", help="창 없이 명령 프롬프트에서 결과를 받아 저장합니다")
@@ -48,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _give_missing_streams_somewhere_to_go()
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")
@@ -69,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
             console.say(str(error))
             return 1
         console.say(f"바로가기를 만들었습니다: {created}")
-        console.say(f"바로가기로 실행하면 결과는 {Path.cwd() / 'results'} 에 저장됩니다.")
+        console.say(f"바로가기로 실행하면 결과는 {settings_file.results_directory().resolve()} 에 저장됩니다.")
         return 0
     if args.command == "capture":
         from . import wizard
@@ -85,7 +88,18 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(str(error))
         return listen.decode_files(args.files, Path(args.out), console, patient, args.note)
     from . import app
+    if args.out is None:
+        args.out = str(settings_file.results_directory())
     return app.run(args)
+
+
+def _give_missing_streams_somewhere_to_go() -> None:
+    """The packaged program is started without a console, where Python has no output streams
+    at all and the first write would stop it. Output redirected to a file still arrives."""
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 
 def _add_port_options(parser: argparse.ArgumentParser) -> None:

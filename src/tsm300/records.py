@@ -15,8 +15,7 @@ from typing import Callable
 from . import links
 from .patient import Order, Patient, parse_birth_date
 from .settings import Settings
-
-EXAM_KIND = "tymp"
+from .store import EXAM_KIND, exam_of
 
 
 class Records:
@@ -144,14 +143,15 @@ def _same_number(one: str, other: str) -> bool:
 
 
 def charts_tested_on(directory: Path, day: date) -> set[str]:
-    """Chart numbers that already have a saved result on ``day``."""
+    """Chart numbers that already have a saved tympanometry result on ``day``."""
     charts = set()
     for path in directory.glob(f"{day:%Y%m%d}_*.json"):
         try:
-            chart = json.loads(path.read_text(encoding="utf-8"))["patient"]["chart_no"]
+            record = json.loads(path.read_text(encoding="utf-8"))
+            chart = record["patient"]["chart_no"]
         except (OSError, ValueError, KeyError, TypeError):
             continue
-        if chart:
+        if chart and exam_of(record) == EXAM_KIND:
             charts.add(chart)
     return charts
 

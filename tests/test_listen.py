@@ -234,3 +234,37 @@ def test_decode_command_prints_a_memo_on_the_sheet(tmp_path):
     assert code == 0
     (record,) = tmp_path.glob("*.json")
     assert json.loads(record.read_text(encoding="utf-8"))["note"] == "재검 필요"
+
+
+def test_saved_result_says_what_kind_of_test_it_holds(tmp_path):
+    from tsm300.store import save_result
+
+    sheet = save_result(parse_message(BOTH), tmp_path, WHEN)
+
+    record = json.loads(sheet.with_suffix(".json").read_text(encoding="utf-8"))
+    assert (record["exam"], record["format"]) == ("tymp", 1)
+
+
+def test_result_of_another_kind_of_test_is_not_opened_as_a_tympanogram(tmp_path):
+    from tsm300.store import load_result, save_result
+
+    sheet = save_result(parse_message(BOTH), tmp_path, WHEN)
+    record_file = sheet.with_suffix(".json")
+    record = json.loads(record_file.read_text(encoding="utf-8"))
+    record_file.write_text(json.dumps(dict(record, exam="pta")), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="pta"):
+        load_result(sheet)
+
+
+def test_result_saved_before_kinds_were_written_down_still_opens(tmp_path):
+    from tsm300.store import load_result, save_result
+
+    measurement = parse_message(BOTH)
+    sheet = save_result(measurement, tmp_path, WHEN)
+    record_file = sheet.with_suffix(".json")
+    record = json.loads(record_file.read_text(encoding="utf-8"))
+    del record["exam"], record["format"]
+    record_file.write_text(json.dumps(record), encoding="utf-8")
+
+    assert load_result(sheet).measurement == measurement

@@ -33,10 +33,19 @@ def windowless_python() -> Path:
     return candidate if candidate.exists() else Path(sys.executable)
 
 
+def start_command() -> tuple[Path, str, Path]:
+    """What a shortcut has to run: the program file, its arguments, and the file holding the icon."""
+    if getattr(sys, "frozen", False):  # the single-file program is its own launcher and carries its icon
+        program = Path(sys.executable)
+        return program, "", program
+    return windowless_python(), "-m tsm300", ICON
+
+
 def create_shortcut(working_directory: Path, folder: Path | None = None) -> Path:
     """Creates the shortcut on the desktop, or in ``folder``, and returns its path.
 
-    The program started from it keeps its results under ``working_directory``.
+    The program started from it runs in ``working_directory``; started from Python, that is
+    where it keeps its results.
     The link is written through the shell's Unicode interface, because the scripting
     one (WScript.Shell) loses any character outside the system's ANSI code page.
     """
@@ -49,11 +58,12 @@ def create_shortcut(working_directory: Path, folder: Path | None = None) -> Path
         link = ctypes.c_void_p()
         ole32.CoCreateInstance(ctypes.byref(_guid(ole32, _CLSID_SHELL_LINK)), None, _CLSCTX_INPROC_SERVER,
                                ctypes.byref(_guid(ole32, _IID_SHELL_LINK_W)), ctypes.byref(link))
+        program, arguments, icon = start_command()
         try:
-            _call(link, _SET_PATH, ctypes.c_wchar_p)(str(windowless_python()))
-            _call(link, _SET_ARGUMENTS, ctypes.c_wchar_p)("-m tsm300")
+            _call(link, _SET_PATH, ctypes.c_wchar_p)(str(program))
+            _call(link, _SET_ARGUMENTS, ctypes.c_wchar_p)(arguments)
             _call(link, _SET_WORKING_DIRECTORY, ctypes.c_wchar_p)(str(working_directory))
-            _call(link, _SET_ICON_LOCATION, ctypes.c_wchar_p, ctypes.c_int)(str(ICON), 0)
+            _call(link, _SET_ICON_LOCATION, ctypes.c_wchar_p, ctypes.c_int)(str(icon), 0)
             _call(link, _SET_DESCRIPTION, ctypes.c_wchar_p)(SHORTCUT_NAME)
             file = ctypes.c_void_p()
             _call(link, _QUERY_INTERFACE, ctypes.POINTER(_Guid), ctypes.POINTER(ctypes.c_void_p))(

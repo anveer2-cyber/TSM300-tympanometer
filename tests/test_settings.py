@@ -1,4 +1,6 @@
 import json
+import sys
+from pathlib import Path
 
 from tsm300 import settings as settings_file
 from tsm300.settings import Settings
@@ -38,3 +40,12 @@ def test_unknown_keys_and_odd_values_are_tolerated(tmp_path):
 def test_directory_can_be_overridden_for_development(monkeypatch, tmp_path):
     monkeypatch.setenv("TSM300_DIR", str(tmp_path))
     assert settings_file.settings_directory() == tmp_path
+
+
+def test_packaged_program_keeps_results_beside_its_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("TSM300_DIR", str(tmp_path))
+    assert settings_file.results_directory() == Path("results")
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+    assert settings_file.results_directory() == tmp_path / "results"
