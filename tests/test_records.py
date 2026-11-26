@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from fakes import KEY, CaptureReceiver, records_database
+from fakes import KEY, TOKEN, CaptureReceiver, RelayServer, records_database
 from tsm300 import links
 from tsm300.patient import Patient
 from tsm300.protocol import parse_message
@@ -71,10 +71,73 @@ def test_database_failures_are_described_without_connection_details():
     assert "pyodbc 가 설치되어 있지 않습니다" in error_text(ModuleNotFoundError("No module named 'pyodbc'"))
 
 
-def test_relay_server_has_no_tympanometry_order_list_yet():
-    relay = Records(links.YejinServer("192.0.2.1", "token"))
-    with pytest.raises(RuntimeError, match="아직 중이검사 오더 목록 주소가 없습니다"):
-        relay.todays_orders()
+@pytest.fixture
+def relay():
+    relay = RelayServer()
+    yield relay
+    relay.close()
+
+
+def test_relay_server_is_asked_at_its_tsm300_addresses_with_the_tsm300_token(relay):
+    records = Records(links.YejinServer(relay.url, TOKEN), today=lambda: DAY)
+
+    assert records.find("00512") == HONG
+    assert records.find("99999") is None
+    orders = records.todays_orders()
+
+    assert relay.requests == [
+        ("/tsm/api/patients", {"q": "00512"}, TOKEN),
+        ("/tsm/api/patients", {"q": "99999"}, TOKEN),
+        ("/tsm/api/orders", {"day": "2026-11-26"}, TOKEN),
+    ]
+    assert [(order.time, order.patient.chart_no, order.patient.name, order.room) for order in orders] == [
+        ("09:12", "00512", "홍길동", "진료1실"),
+        ("09:40", "12345", "김하나", "진료2실"),
+        ("10:30", "", "(환자 정보 없음)", ""),
+    ]
+    assert orders[0].label == "고막운동성계측 · 등골근반사"
+    assert orders[0].patient == HONG
+    assert [order.selectable for order in orders] == [True, True, False]
+
+
+def test_a_blank_internal_number_from_the_relay_marks_the_chart_as_uncertain(relay):
+    records = Records(links.YejinServer(relay.url, TOKEN), today=lambda: DAY)
+
+    assert not records.uncertain("12345")
+    assert records.find("12345") == Patient("12345", "김하나", "여", date(1980, 1, 31))
+
+    assert records.uncertain("12345")
+    assert records.find("00512") and not records.uncertain("00512")
+
+
+def test_the_records_database_always_ties_a_chart_to_one_record(records):
+    records.find("00512")
+    records.todays_orders()
+
+    assert not records.uncertain("00512") and not records.uncertain("24680")
+
+
+def test_relay_server_refusals_are_passed_on_in_its_own_words(relay):
+    wrong_token = Records(links.YejinServer(relay.url, "wrong"))
+    with pytest.raises(RuntimeError, match="예진이 서버 401: 토큰이 맞지 않습니다"):
+        wrong_token.find("00512")
+    with pytest.raises(RuntimeError, match="예진이 서버 401"):
+        wrong_token.todays_orders()
+    with pytest.raises(RuntimeError, match="주소 · 토큰이 비어 있습니다"):
+        Records(links.YejinServer(relay.url, "")).find("00512")
+
+
+def test_a_relay_server_too_old_to_know_tsm300_says_which_version_is_needed():
+    old = RelayServer(old_version=True)
+    try:
+        with pytest.raises(RuntimeError, match="v4.52.0 이상인지 확인"):
+            Records(links.YejinServer(old.url, TOKEN)).todays_orders()
+    finally:
+        old.close()
+
+
+def test_connection_check_describes_the_relay_server(relay):
+    assert Records(links.YejinServer(relay.url, TOKEN)).check() == "예진이 서버에 연결됨"
 
 
 def test_settings_choose_where_patients_are_looked_up():

@@ -230,7 +230,7 @@ class MagicDb:
         return out
 
 
-# ------------------------------------------------------------------ 1. 예진이 서버가 대신 읽어 줌 (매직차트가 없는 PC)
+# ------------------------------------------------------------------ 1 · 2. 예진이 서버가 대신 읽어 줌 (매직차트가 없는 PC)
 YEJIN_PORT = 5050
 
 
@@ -246,9 +246,9 @@ def server_url(u, port):
 
 
 class YejinServer:
-    """MagicDb 와 같은 쓰임 — 매직차트 DB 대신 예진이 중계서버의 VNG 전용 읽기 주소에 물음(머리글 X-VNG-Token).
-    지금 서버에 있는 주소: /vng/api/patients?q= · /vng/api/vest_orders?day= (평형검사 F631~F633 만).
-    TSM300 이 이 토큰을 같이 써도 되는지, 중이검사 오더 주소를 만들지는 예진이 세션이 정함(확인 필요)."""
+    """MagicDb 와 같은 쓰임 — 매직차트 DB 대신 예진이 중계서버의 TSM300 전용 읽기 주소에 물음(예진이 v4.52.0 이상).
+    주소: GET /tsm/api/patients?q= · GET /tsm/api/orders?day=YYYY-MM-DD, 머리글 X-TSM-Token.
+    약속의 원본은 예진이 저장소 docs/TSM300/조회주소_약속.md. 답에 칸이 더해질 수 있으므로 모르는 칸은 무시함."""
 
     def __init__(self, url, token, opener=None):
         self.base, self.token, self.used_dsn = server_url(url, YEJIN_PORT), (token or '').strip(), '예진이 서버'
@@ -258,7 +258,7 @@ class YejinServer:
         if not self.base or not self.token:
             raise RuntimeError('예진이 서버 주소 · 토큰이 비어 있습니다')
         req = urllib.request.Request(f'{self.base}{path}?{urllib.parse.urlencode(params)}',
-                                     headers={'X-VNG-Token': self.token, 'User-Agent': 'TSM300'})
+                                     headers={'X-TSM-Token': self.token, 'User-Agent': 'TSM300'})
         try:
             with self.opener.open(req, timeout=8) as r:
                 d = json.loads(r.read().decode('utf-8'))
@@ -267,6 +267,8 @@ class YejinServer:
                 msg = json.loads(ex.read().decode('utf-8')).get('error') or ''
             except Exception:
                 msg = ''
+            if ex.code == 404 and not msg:                        # 옛 판 서버에는 /tsm 주소가 없음
+                msg = '주소가 없습니다 — 예진이 서버가 v4.52.0 이상인지 확인해 주세요'
             raise RuntimeError(f'예진이 서버 {ex.code}: {msg or ex.reason}') from None
         except (urllib.error.URLError, OSError, socket.timeout) as ex:
             raise RuntimeError(f'예진이 서버({self.base})에 연결하지 못했습니다 ({getattr(ex, "reason", ex)})') from None
@@ -278,12 +280,14 @@ class YejinServer:
 
     @staticmethod
     def _norm(p, how):
+        """code = 매직차트 내부번호(글자). 서버가 환자를 한 명으로 정하지 못하면 일부러 비워 보냄 → None."""
         try:
             age = int(p.get('age')) if p.get('age') not in (None, '') else None
         except (TypeError, ValueError):
             age = None
         sex = {'M': '남', 'F': '여'}.get(str(p.get('sex') or ''), str(p.get('sex') or ''))
-        return dict(chart=str(p.get('chart') or '').strip(), code=None, name=str(p.get('name') or '').strip(),
+        return dict(chart=str(p.get('chart') or '').strip(), code=str(p.get('chart_code') or '').strip() or None,
+                    name=str(p.get('name') or '').strip(),
                     birth=str(p.get('birth') or '').replace('.', '-'), age=age, sex=sex if sex in ('남', '여') else '',
                     how=how, last=str(p.get('last') or '')[:10])
 
@@ -291,17 +295,32 @@ class YejinServer:
         q = re.sub(r'\s', '', q or '')[:20]
         if not q:
             return []
-        return [x for x in (self._norm(p, p.get('how') or '') for p in self._get('/vng/api/patients', {'q': q}).get('patients') or []) if x['chart']]
+        return [x for x in (self._norm(p, p.get('how') or '') for p in self._get('/tsm/api/patients', {'q': q}).get('patients') or []) if x['chart']]
 
     def find_patient(self, chart_no):
         chart_no = str(chart_no or '').strip()
+        if not chart_no:
+            return None
         hit = [p for p in self.search(chart_no) if p['chart'] == chart_no and p['how'] == '차트번호']
         if len(hit) > 1:
             raise LookupError(f'차트번호 {chart_no} 환자가 {len(hit)}명입니다 — 사람이 확인해 주세요')
         return hit[0] if hit else None
 
     def todays_orders(self, order_codes=TYMP_CODES, day=None):
-        raise NotImplementedError('예진이 서버에는 아직 평형검사(F631~F633) 오더 주소만 있습니다 — 중이검사 오더 주소는 예진이 세션에 요청')
+        """그날 중이검사 오더가 난 진료 → MagicDb.todays_orders 와 같은 모양. 어떤 코드를 볼지는 서버가 정함(F6361~F6363)."""
+        day = day or datetime.date.today().isoformat()
+        out = []
+        for o in self._get('/tsm/api/orders', {'day': day}).get('orders') or []:
+            p = self._norm(o, '오늘 오더')
+            if not p['chart']:
+                p['name'] = '(환자 정보 없음)'
+            codes = [str(c).strip().upper() for c in o.get('codes') or [] if str(c).strip()]
+            p.update(time=str(o.get('time') or '')[:5], room=str(o.get('room') or '').strip(), codes=codes,
+                     tests=' · '.join(TYMP_NAMES.get(c, c) for c in codes), visit=o.get('visit'))
+            del p['last']
+            out.append(p)
+        out.sort(key=lambda p: p['time'])
+        return out
 
     def close(self):
         pass

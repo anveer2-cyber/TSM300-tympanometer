@@ -192,10 +192,11 @@ class SettingsDialog(QDialog):
         self.dsn_edit.setPlaceholderText("비워 두면 이 PC 의 SQL Anywhere 연결을 찾아 씁니다")
         form.addRow("ODBC 이름", self.dsn_edit)
         self.server_edit = QLineEdit(settings.emr_server)
-        self.server_edit.setPlaceholderText("예: 192.168.0.10")
+        self.server_edit.setPlaceholderText("예진이 서버 PC 주소, 예: 192.168.0.10 (예진이 v4.52.0 이상)")
         form.addRow("예진이 서버 주소", self.server_edit)
         self.token_edit = QLineEdit(settings.emr_token)
         self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.token_edit.setPlaceholderText("서버 PC 콘솔에서 m + Enter 를 치면 나옵니다")
         form.addRow("예진이 서버 토큰", self.token_edit)
         self.lookup_test_button = QPushButton("연결 시험")
         self.lookup_test_button.clicked.connect(self.test_lookup)
@@ -641,7 +642,12 @@ class MainWindow(QMainWindow):
     def _can_send(self) -> bool:
         return (self._sheet is not None and not self._sending and self._settings.capture_ready
                 and bool(self._sheet_patient.chart_no and self._sheet_patient.name)
+                and not self._identity_uncertain()
                 and not (self._sent and self._sent.get("ok")))
+
+    def _identity_uncertain(self) -> bool:
+        """True when the records system did not tie the saved sheet's chart number to one patient."""
+        return self._source is not None and self._source.uncertain(self._sheet_patient.chart_no)
 
     def _measurement_received(self, measurement: Measurement) -> None:
         if measurement.left is None and measurement.right is None:
@@ -718,9 +724,13 @@ class MainWindow(QMainWindow):
         sent = self._sent
         if sent is None:
             text = ""
-            if self._sheet is not None and self._settings.capture_ready and not self._sheet_patient.is_empty \
-                    and not (self._sheet_patient.chart_no and self._sheet_patient.name):
+            if self._sheet is None or not self._settings.capture_ready or self._sheet_patient.is_empty:
+                pass
+            elif not (self._sheet_patient.chart_no and self._sheet_patient.name):
                 text = "상쾌한캡처로 보내려면 차트번호와 이름이 모두 필요합니다."
+            elif self._identity_uncertain():
+                text = ("⚠ 전자차트에서 이 차트번호의 환자를 한 명으로 확정하지 못해 상쾌한캡처로 보내지 않습니다. "
+                        "결과지는 저장했으니 상쾌한캡처에서 직접 넣어 주세요.")
         elif sent.get("ok"):
             again = " (이미 들어가 있던 결과지)" if sent.get("duplicate") else ""
             text = f"✔ 상쾌한캡처에 저장했습니다{again}: {sent.get('imageDataName') or ''}"

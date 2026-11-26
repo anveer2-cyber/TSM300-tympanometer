@@ -119,3 +119,71 @@ def _form_fields(content_type: str, body: bytes) -> dict:
         value = value[:-2]
         fields[name] = value if name == "file" else value.decode("utf-8")
     return fields
+
+
+TOKEN = "relay-token"
+
+
+class RelayServer:
+    """Answers like the clinic's relay server's TSM300 addresses, from made-up records."""
+
+    PATIENTS = [
+        {"chart": "00512", "chart_code": "512", "name": "홍길동", "birth": "1975-03-04", "age": 51, "sex": "남",
+         "last": "2026-11-26", "how": "차트번호"},
+        {"chart": "12345", "chart_code": "", "name": "김하나", "birth": "1980-01-31", "age": 46, "sex": "여",
+         "last": "2026-11-20", "how": "차트번호"},
+    ]
+    ORDERS = [
+        {"chart": "12345", "chart_code": "", "name": "김하나", "birth": "1980-01-31", "age": 46, "sex": "여",
+         "time": "09:40", "room": "진료2실", "codes": ["F6361"], "visit": 2},
+        {"chart": "00512", "chart_code": "512", "name": "홍길동", "birth": "1975-03-04", "age": 51, "sex": "남",
+         "time": "09:12", "room": "진료1실", "codes": ["F6361", "F6362"], "visit": 1, "added_later": "ignored"},
+        {"chart": "", "chart_code": "", "name": "", "birth": "", "age": None, "sex": "",
+         "time": "10:30", "room": "", "codes": ["F6361"], "visit": 3},
+    ]
+
+    def __init__(self, old_version: bool = False) -> None:
+        self.requests: list[tuple[str, dict, str | None]] = []
+        relay = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def _reply(self, status, body):
+                data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                from urllib.parse import parse_qs, urlsplit
+
+                parts = urlsplit(self.path)
+                query = {name: values[0] for name, values in parse_qs(parts.query).items()}
+                relay.requests.append((parts.path, query, self.headers.get("X-TSM-Token")))
+                if old_version:
+                    self.send_error(404)
+                elif self.headers.get("X-TSM-Token") != TOKEN:
+                    self._reply(401, {"ok": False, "error": "토큰이 맞지 않습니다"})
+                elif parts.path == "/tsm/api/patients":
+                    found = [p for p in relay.PATIENTS if p["chart"] == query.get("q")]
+                    self._reply(200, {"ok": True, "patients": found})
+                elif parts.path == "/tsm/api/orders":
+                    day = query.get("day", "")
+                    if len(day) != 10:
+                        self._reply(400, {"ok": False, "error": "day 는 YYYY-MM-DD 여야 합니다"})
+                    else:
+                        self._reply(200, {"ok": True, "day": day, "orders": relay.ORDERS})
+                else:
+                    self._reply(404, {"ok": False, "error": "없는 주소입니다"})
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"127.0.0.1:{self._server.server_address[1]}"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()

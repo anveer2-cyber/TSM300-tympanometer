@@ -25,6 +25,7 @@ class Records:
     def __init__(self, backend, today: Callable[[], date] = date.today) -> None:
         self._backend = backend
         self._today = today
+        self._uncertain: set[str] = set()
 
     def find(self, chart_no: str) -> Patient | None:
         """The patient with this chart number. Raises LookupError when two patients share it."""
@@ -34,19 +35,34 @@ class Records:
             raise
         except Exception as error:
             raise RuntimeError(error_text(error)) from None
-        return to_patient(found) if found else None
+        return self._patient(found) if found else None
 
     def todays_orders(self) -> list[Order]:
         try:
             rows = self._backend.todays_orders(links.TYMP_CODES, self._today().isoformat())
-        except NotImplementedError:
-            raise RuntimeError("예진이 서버에는 아직 중이검사 오더 목록 주소가 없습니다. 차트번호 조회는 쓸 수 있습니다.") from None
         except Exception as error:
             raise RuntimeError(error_text(error)) from None
         return [
-            Order(to_patient(row), time=row.get("time") or "", label=row.get("tests") or "", room=row.get("room") or "")
+            Order(self._patient(row), time=row.get("time") or "", label=row.get("tests") or "", room=row.get("room") or "")
             for row in rows
         ]
+
+    def uncertain(self, chart_no: str) -> bool:
+        """True when the records gave this chart number without tying it to one patient record.
+
+        The relay server leaves the internal number blank on purpose in that case, so that
+        nothing is filed under a number that might belong to someone else.
+        """
+        return chart_no in self._uncertain
+
+    def _patient(self, found: dict) -> Patient:
+        patient = to_patient(found)
+        if patient.chart_no:
+            if found.get("code") is None:
+                self._uncertain.add(patient.chart_no)
+            else:
+                self._uncertain.discard(patient.chart_no)
+        return patient
 
     def check(self) -> str:
         """Tries the connection and describes it. Raises RuntimeError with the reason on failure."""

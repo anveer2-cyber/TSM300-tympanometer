@@ -17,7 +17,7 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from conftest import needs_pty, pty  # noqa: E402
-from fakes import KEY, CaptureReceiver  # noqa: E402
+from fakes import KEY, TOKEN, CaptureReceiver, RelayServer  # noqa: E402
 from tsm300 import settings as settings_file  # noqa: E402
 from tsm300.app import REPLACE_LABEL, SAVE_LABEL, MainWindow, SettingsDialog, run_in_background  # noqa: E402
 from tsm300.patient import Order, Patient  # noqa: E402
@@ -38,9 +38,10 @@ SENDING = Settings(cap_on=True, cap_url="192.0.2.1", cap_key="key")
 class FakeRecords:
     """A stand-in for the clinic's records system."""
 
-    def __init__(self, failing=False, delay=0.0):
+    def __init__(self, failing=False, delay=0.0, uncertain_charts=()):
         self.failing = failing
         self.delay = delay
+        self.uncertain_charts = set(uncertain_charts)
 
     def find(self, chart_no):
         time.sleep(self.delay)
@@ -56,6 +57,9 @@ class FakeRecords:
             raise RuntimeError("서버에 연결할 수 없습니다")
         return [Order(KIM, "09:10", "고막운동성계측", "진료1실"), Order(LEE, "09:25", "고막운동성계측", "진료2실"),
                 Order(UNKNOWN, "09:40", "고막운동성계측", "진료1실")]
+
+    def uncertain(self, chart_no):
+        return chart_no in self.uncertain_charts
 
 
 class FakeSender:
@@ -470,6 +474,23 @@ def test_moving_a_sent_result_to_another_patient_warns_that_the_sent_copy_stays(
     assert [patient for _, patient, _ in sender.sent] == [KIM, LEE]
 
 
+def test_nothing_is_sent_for_a_chart_the_records_could_not_tie_to_one_patient(qapp, results):
+    sender = FakeSender()
+    window = open_window(qapp, results, settings=SENDING, send=sender, source=FakeRecords(uncertain_charts={"12345"}))
+    window.orders_table.cellClicked.emit(0, 0)
+
+    window.handle_event(BOTH)
+
+    assert sender.sent == []
+    assert "20261126_211205_12345.jpg" in saved(results)
+    assert "한 명으로 확정하지 못해 상쾌한캡처로 보내지 않습니다" in window.capture_label.text()
+    assert not window.send_button.isEnabled()
+
+    window.orders_table.cellClicked.emit(1, 0)
+    window.handle_event(LEFT_ONLY)
+    assert [patient for _, patient, _ in sender.sent] == [LEE]
+
+
 def test_sheet_reaches_a_receiver_over_the_network(qapp, results):
     receiver = CaptureReceiver(patient=("12345", "김하나", "1980-01-31"))
     try:
@@ -524,20 +545,24 @@ def test_settings_dialog_tests_the_receiver_connection(qapp):
 
 
 def test_applying_settings_saves_them_and_switches_lookup_on(qapp, results):
-    window = open_window(qapp, results)
-    directory = results.parent / "settings"
+    relay = RelayServer()
+    try:
+        window = open_window(qapp, results)
+        directory = results.parent / "settings"
 
-    window.apply_settings(Settings(emr_via="server", emr_server="192.0.2.1", emr_token="token",
-                                   cap_url="192.0.2.2", cap_key="key"))
+        window.apply_settings(Settings(emr_via="server", emr_server=relay.url, emr_token=TOKEN,
+                                       cap_url="192.0.2.2", cap_key="key"))
 
-    assert settings_file.load(directory).emr_server == "192.0.2.1"
-    assert window.orders_box.isVisible() and window.find_button.isVisible() and not window.source_note.isVisible()
-    assert "아직 중이검사 오더 목록 주소가 없습니다" in window.orders_note.text()
-    assert window.send_button.isVisible()
+        assert settings_file.load(directory).emr_server == relay.url
+        assert window.orders_box.isVisible() and window.find_button.isVisible() and not window.source_note.isVisible()
+        assert order_row(window, 0)[:5] == ["09:12", "00512", "홍길동", "51세 남", "진료1실"]
+        assert window.send_button.isVisible()
 
-    window.apply_settings(Settings())
-    assert not window.orders_box.isVisible() and window.source_note.isVisible()
-    assert not window.send_button.isVisible()
+        window.apply_settings(Settings())
+        assert not window.orders_box.isVisible() and window.source_note.isVisible()
+        assert not window.send_button.isVisible()
+    finally:
+        relay.close()
 
 
 # ----- the serial port ---------------------------------------------------------------------
