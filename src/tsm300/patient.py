@@ -50,6 +50,12 @@ class Order:
     patient: Patient
     time: str = ""
     label: str = ""
+    room: str = ""
+
+    @property
+    def selectable(self) -> bool:
+        """False for an order whose patient the records system could not identify."""
+        return bool(self.patient.chart_no)
 
 
 class PatientSource(Protocol):

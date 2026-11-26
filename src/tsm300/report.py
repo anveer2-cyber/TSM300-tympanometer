@@ -45,6 +45,12 @@ LEFT_EAR = "#257de0"
 NORMAL_PRESSURE = (-150, 100)
 NORMAL_COMPLIANCE = (0.2, 1.5)
 
+# 90% ranges of Margolis & Heller (1987), rounded as in the ASHA (1990) screening guidelines.
+# The device gives no range for these two. The children were three to five years old.
+ADULT_FROM_AGE = 18
+EAR_VOLUME_RANGE = {"adult": (0.6, 1.5), "child": (0.4, 1.0)}
+WIDTH_RANGE = {"adult": (50, 110), "child": (60, 150)}
+
 _KOREAN_FONTS = ("Malgun Gothic", "Apple SD Gothic Neo", "NanumGothic", "Noto Sans CJK KR", "Noto Sans KR")
 
 _KOREAN = {
@@ -66,7 +72,10 @@ _KOREAN = {
     "volume": "외이도 용적 (ml)",
     "compliance": "컴플라이언스 (ml)",
     "width": "폭 (daPa)",
-    "reference_note": "참고 범위는 장비 화면에 표시되는 정상 범위 사각형 기준입니다.",
+    "reference_note": ("참고 범위: 중이 압력과 컴플라이언스는 장비 화면의 정상 범위 사각형, "
+                       "외이도 용적과 폭은 Margolis & Heller (1987) 기준입니다. 소아는 3~5세 자료입니다."),
+    "adult": "성인",
+    "child": "소아",
     "reflex": "등골근 반사 (동측, ml)",
     "normal_range": "정상 범위",
     "not_measured": "측정 없음",
@@ -92,7 +101,10 @@ _ENGLISH = {
     "volume": "Ear volume (ml)",
     "compliance": "Compliance (ml)",
     "width": "Width (daPa)",
-    "reference_note": "Reference ranges follow the normal box shown on the device's screen.",
+    "reference_note": ("Reference: pressure and compliance follow the normal box on the device's screen; "
+                       "ear volume and width follow Margolis & Heller (1987), children aged 3 to 5."),
+    "adult": "Adult",
+    "child": "Child",
     "reflex": "Acoustic reflex (ipsilateral, ml)",
     "normal_range": "Normal range",
     "not_measured": "Not measured",
@@ -126,7 +138,7 @@ def render(measurement: Measurement, path: Path, received_at: datetime,
         _draw_header(figure, labels, clinic if labels is _KOREAN else "", received_at)
         _draw_patient(figure, labels, patient, received_at)
         _draw_tympanograms(figure, labels, measurement)
-        _draw_values(figure, labels, measurement)
+        _draw_values(figure, labels, measurement, patient.age_on(received_at.date()))
         _draw_reflexes(figure, labels, measurement)
         _draw_footer(figure, labels, measurement)
         options = {"quality": 95, "subsampling": 0} if Path(path).suffix.lower() in (".jpg", ".jpeg") else {}
@@ -197,8 +209,8 @@ def _plot_tympanogram(axes, ear: EarResult, color: str, labels: dict) -> None:
     axes.set_xlabel(labels["pressure_axis"], fontsize=8.5, color=INK_SECONDARY, labelpad=3)
 
 
-def _draw_values(figure: Figure, labels: dict, measurement: Measurement) -> None:
-    right_x, left_x, reference_x = 108.0, 143.0, 180.0
+def _draw_values(figure: Figure, labels: dict, measurement: Measurement, age: int | None) -> None:
+    right_x, left_x, reference_x = 96.0, 127.0, 169.0
     _text(figure, MARGIN, 165, labels["values"], size=11, weight="bold")
     _text(figure, MARGIN, 173, labels["item"], size=9, color=INK_SECONDARY)
     for x, name, color in ((right_x, labels["right"], RIGHT_EAR), (left_x, labels["left"], LEFT_EAR)):
@@ -210,18 +222,24 @@ def _draw_values(figure: Figure, labels: dict, measurement: Measurement) -> None
     low_compliance, high_compliance = NORMAL_COMPLIANCE
     rows = [
         (labels["pressure"], lambda ear: f"{ear.middle_ear_pressure:d}", f"{low_pressure} ~ +{high_pressure}"),
-        (labels["volume"], lambda ear: f"{ear.ear_volume:.2f}", ""),
+        (labels["volume"], lambda ear: f"{ear.ear_volume:.2f}", _by_age(EAR_VOLUME_RANGE, age, labels)),
         (labels["compliance"], lambda ear: f"{ear.compliance:.2f}", f"{low_compliance} ~ {high_compliance}"),
-        (labels["width"], lambda ear: f"{ear.width:d}", ""),
+        (labels["width"], lambda ear: f"{ear.width:d}", _by_age(WIDTH_RANGE, age, labels)),
     ]
     for index, (label, value_of, reference) in enumerate(rows):
         y = 183 + index * 8.5
         _text(figure, MARGIN, y, label, size=10)
         for x, ear in ((right_x, measurement.right), (left_x, measurement.left)):
             _text(figure, x, y, value_of(ear) if ear else "-", size=12, weight="bold", ha="center")
-        _text(figure, reference_x, y, reference or "-", size=9.5, color=INK_SECONDARY, ha="center")
+        _text(figure, reference_x, y, reference, size=9, color=INK_SECONDARY, ha="center")
         _rule(figure, y + 3.5, color=ROW_RULE)
-    _text(figure, MARGIN, 216.5, labels["reference_note"], size=7.5, color=INK_SECONDARY)
+    _text(figure, MARGIN, 216.5, labels["reference_note"], size=7, color=INK_SECONDARY)
+
+
+def _by_age(ranges: dict, age: int | None, labels: dict) -> str:
+    """The adult range for an adult; both ranges for a child or when the age is unknown."""
+    groups = ("adult",) if age is not None and age >= ADULT_FROM_AGE else ("adult", "child")
+    return " · ".join(f"{labels[group]} {ranges[group][0]} ~ {ranges[group][1]}" for group in groups)
 
 
 def _draw_reflexes(figure: Figure, labels: dict, measurement: Measurement) -> None:

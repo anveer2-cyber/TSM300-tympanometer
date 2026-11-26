@@ -1,32 +1,73 @@
-"""The operator's window: choose or type the patient, receive results, save the result sheet."""
+"""The operator's window: choose or type the patient, receive results, save and send the result sheet."""
 
 from __future__ import annotations
 
 import sys
+import threading
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 import serial
-from PySide6.QtCore import QSettings, QSize, Qt, QThread, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QSizePolicy,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import __version__
+from . import __version__, links
+from . import settings as settings_file
 from .console import available_ports, open_port
 from .listen import RETRY_AFTER, open_file, read_events
 from .patient import Order, Patient, PatientSource, parse_birth_date
 from .protocol import Corrupt, Measurement, PowerOn
+from .records import Records, charts_tested_on, records_from_settings, send_sheet
 from .report import prepare
+from .settings import Settings
 from .store import delete_result, save_result
 
-NO_SOURCE_NOTE = "차트번호 조회와 오늘 검사 오더 목록은 병원 전산 연동 후에 쓸 수 있습니다. 지금은 직접 입력해 주세요."
+NO_SOURCE_NOTE = "차트번호 조회와 오늘 검사 오더 목록은 [설정]에서 환자 조회를 연결하면 쓸 수 있습니다. 지금은 직접 입력해 주세요."
 WAITING = "검사 결과를 기다리는 중입니다. 검사 후 장비의 → 키를 누르세요."
 SAVE_LABEL = "이 환자 정보로 저장"
 REPLACE_LABEL = "직전 결과지의 환자 바꾸기..."
+ORDER_COLUMNS = ("접수", "차트번호", "이름", "나이·성별", "진료실", "검사")
+ORDERS_REFRESH_MS = 30_000
+DONE_INK = QColor("#9a9a9a")
+
+Background = Callable[[QObject, Callable[[], object], Callable[[object, "Exception | None"], None]], None]
+
+
+def run_in_background(owner: QObject, work: Callable[[], object],
+                      done: Callable[[object, Exception | None], None]) -> None:
+    """Runs ``work`` on a thread, then calls ``done(result, error)`` on the window's thread.
+
+    Nothing is called if ``owner`` is destroyed first, so a closing window is safe.
+    """
+    box: dict = {}
+
+    def target() -> None:
+        try:
+            box["result"] = work()
+        except Exception as error:  # reported to ``done``; a failed lookup must not end the thread silently
+            box["error"] = error
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    timer = QTimer(owner)
+    timer.setInterval(50)
+
+    def poll() -> None:
+        if thread.is_alive():
+            return
+        timer.stop()
+        timer.deleteLater()
+        done(box.get("result"), box.get("error"))
+
+    timer.timeout.connect(poll)
+    timer.start()
 
 
 class SerialWorker(QThread):
@@ -96,15 +137,158 @@ class SheetPreview(QLabel):
         self.setPixmap(scaled)
 
 
+class PatientConfirm(QDialog):
+    """Asks whether the patient found in the records is the one in the room. Enter accepts, Esc declines."""
+
+    def __init__(self, parent: QWidget, patient: Patient, today) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("환자 확인")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 22, 28, 18)
+        layout.addWidget(QLabel("이 환자가 맞습니까?"))
+        name = QLabel(patient.name)
+        name.setStyleSheet("font-size: 26pt; font-weight: 700;")
+        layout.addWidget(name)
+        chart = QLabel(f"차트번호 {patient.chart_no}")
+        chart.setStyleSheet("font-size: 20pt;")
+        layout.addWidget(chart)
+        layout.addWidget(QLabel(_details(patient, today)))
+        buttons = QDialogButtonBox()
+        yes = buttons.addButton("맞습니다 (Enter)", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton("아니요 (Esc)", QDialogButtonBox.ButtonRole.RejectRole)
+        yes.setDefault(True)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
+class SettingsDialog(QDialog):
+    """Where patients are looked up and where result sheets are sent."""
+
+    def __init__(self, parent: QWidget | None, settings: Settings, background: Background = run_in_background) -> None:
+        super().__init__(parent)
+        self._original = settings
+        self._background = background
+        self.setWindowTitle("설정")
+        self.setMinimumWidth(520)
+        layout = QVBoxLayout(self)
+
+        lookup = QGroupBox("환자 조회")
+        form = QFormLayout(lookup)
+        self.via_combo = QComboBox()
+        for label, value in (("쓰지 않음 (직접 입력만)", ""), ("매직차트 DB (이 PC 의 ODBC 연결)", "odbc"),
+                             ("예진이 서버", "server")):
+            self.via_combo.addItem(label, value)
+        self.via_combo.setCurrentIndex(max(0, self.via_combo.findData(settings.emr_via)))
+        form.addRow("방법", self.via_combo)
+        self.dsn_edit = QLineEdit(settings.emr_dsn)
+        self.dsn_edit.setPlaceholderText("비워 두면 이 PC 의 SQL Anywhere 연결을 찾아 씁니다")
+        form.addRow("ODBC 이름", self.dsn_edit)
+        self.server_edit = QLineEdit(settings.emr_server)
+        self.server_edit.setPlaceholderText("예: 192.168.0.10")
+        form.addRow("예진이 서버 주소", self.server_edit)
+        self.token_edit = QLineEdit(settings.emr_token)
+        self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("예진이 서버 토큰", self.token_edit)
+        self.lookup_test_button = QPushButton("연결 시험")
+        self.lookup_test_button.clicked.connect(self.test_lookup)
+        self.lookup_result = QLabel()
+        self.lookup_result.setWordWrap(True)
+        form.addRow(self.lookup_test_button, self.lookup_result)
+        layout.addWidget(lookup)
+
+        capture = QGroupBox("상쾌한캡처 (결과지 보내기)")
+        form = QFormLayout(capture)
+        self.cap_url_edit = QLineEdit(settings.cap_url)
+        self.cap_url_edit.setPlaceholderText("진료실 PC 주소, 예: 192.168.0.10")
+        form.addRow("받는 PC 주소", self.cap_url_edit)
+        self.cap_key_edit = QLineEdit(settings.cap_key)
+        self.cap_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.cap_key_edit.setPlaceholderText("상쾌한캡처 설정의 [검사 장비 추가]에서 받은 키")
+        form.addRow("키", self.cap_key_edit)
+        self.cap_on_check = QCheckBox("결과지를 저장하면 바로 상쾌한캡처로 보내기")
+        self.cap_on_check.setChecked(settings.cap_on)
+        form.addRow(self.cap_on_check)
+        self.capture_test_button = QPushButton("연결 시험")
+        self.capture_test_button.clicked.connect(self.test_capture)
+        self.capture_result = QLabel()
+        self.capture_result.setWordWrap(True)
+        form.addRow(self.capture_test_button, self.capture_result)
+        layout.addWidget(capture)
+
+        buttons = QDialogButtonBox()
+        buttons.addButton("저장", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton("취소", QDialogButtonBox.ButtonRole.RejectRole)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.via_combo.currentIndexChanged.connect(self._show_fields)
+        self._show_fields()
+
+    def settings(self) -> Settings:
+        """The settings as edited in the dialog."""
+        return replace(
+            self._original,
+            emr_via=self.via_combo.currentData(),
+            emr_dsn=self.dsn_edit.text().strip(),
+            emr_server=self.server_edit.text().strip(),
+            emr_token=self.token_edit.text().strip(),
+            cap_url=self.cap_url_edit.text().strip(),
+            cap_key=self.cap_key_edit.text().strip(),
+            cap_on=self.cap_on_check.isChecked(),
+        )
+
+    def test_lookup(self) -> None:
+        records = records_from_settings(self.settings())
+        if records is None:
+            self.lookup_result.setText("환자 조회를 쓰지 않는 설정입니다.")
+            return
+        self.lookup_result.setText("연결하는 중...")
+
+        def done(result, error) -> None:
+            records.close()
+            self.lookup_result.setText(f"⚠ {error}" if error else f"✔ {result}")
+
+        self._background(self, records.check, done)
+
+    def test_capture(self) -> None:
+        edited = self.settings()
+        self.capture_result.setText("연결하는 중...")
+
+        def done(result, error) -> None:
+            if error:
+                self.capture_result.setText(f"⚠ {error}")
+            else:
+                self.capture_result.setText(f"✔ 연결됨: {result.get('device')} → {result.get('pc')}")
+
+        self._background(self, lambda: links.entcapture_hello(edited.cap_url, edited.cap_key), done)
+
+    def _show_fields(self) -> None:
+        via = self.via_combo.currentData()
+        self.dsn_edit.setEnabled(via == "odbc")
+        self.server_edit.setEnabled(via == "server")
+        self.token_edit.setEnabled(via == "server")
+        self.lookup_test_button.setEnabled(bool(via))
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, directory: Path, source: PatientSource | None = None,
+    def __init__(self, directory: Path, settings: Settings | None = None, source: PatientSource | None = None,
                  now: Callable[[], datetime] = datetime.now,
-                 confirm: Callable[[str], bool] | None = None) -> None:
+                 confirm: Callable[[str], bool] | None = None,
+                 confirm_patient: Callable[[Patient], bool] | None = None,
+                 background: Background = run_in_background,
+                 send: Callable[..., dict] = send_sheet,
+                 settings_directory: Path | None = None) -> None:
         super().__init__()
         self._directory = directory
-        self._source = source
+        self._settings = settings or Settings()
+        self._settings_directory = settings_directory
+        self._source = source if source is not None else records_from_settings(self._settings)
         self._now = now
         self._confirm = confirm or self._ask
+        self._confirm_patient = confirm_patient or self._ask_patient
+        self._background = background
+        self._send = send
         self._connection = "포트에 연결하지 않았습니다."
         self._measurement: Measurement | None = None
         self._received_at: datetime | None = None
@@ -112,10 +296,17 @@ class MainWindow(QMainWindow):
         self._sheet_patient = Patient()
         self._patient_is_new = False
         self._orders: list[Order] = []
+        self._loading_orders = False
+        self._sending = False
+        self._sent: dict | None = None
         self.setWindowTitle(f"TSM-300 임피던스 청력검사 v{__version__}")
-        self.resize(1180, 820)
+        self.resize(1240, 840)
         self._build()
-        self.refresh_orders()
+        self._orders_timer = QTimer(self)
+        self._orders_timer.setInterval(ORDERS_REFRESH_MS)
+        self._orders_timer.timeout.connect(self.refresh_orders)
+        self._orders_timer.start()
+        self._show_source()
         self._show_state()
 
     # ----- layout -------------------------------------------------------------------------
@@ -128,36 +319,51 @@ class MainWindow(QMainWindow):
         columns.setSpacing(14)
 
         side = QVBoxLayout()
+        side.setContentsMargins(0, 0, 0, 0)
         side.setSpacing(12)
-        side.addWidget(self._build_orders(), stretch=1)
+        self.orders_box = self._build_orders()
+        side.addWidget(self.orders_box, stretch=1)
         side.addWidget(self._build_patient_form())
-        if self._source is None:
-            side.addStretch(1)
+        self._side_filler = QWidget()
+        self._side_filler.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        side.addWidget(self._side_filler)
         side_holder = QWidget()
         side_holder.setLayout(side)
-        side_holder.setFixedWidth(360)
+        side_holder.setFixedWidth(430)
         columns.addWidget(side_holder)
 
         main = QVBoxLayout()
         main.setSpacing(10)
+        top = QHBoxLayout()
         self.connection_label = QLabel(self._connection)
         self.connection_label.setStyleSheet("color: #666666;")
-        main.addWidget(self.connection_label)
+        top.addWidget(self.connection_label, stretch=1)
+        settings_button = QPushButton("설정")
+        settings_button.clicked.connect(self.open_settings)
+        top.addWidget(settings_button)
+        main.addLayout(top)
         self.state_label = QLabel()
         self.state_label.setWordWrap(True)
         self.state_label.setStyleSheet("font-size: 15px; font-weight: 600; padding: 10px 12px;"
                                        " background: #f3f3f3; border-radius: 6px;")
         main.addWidget(self.state_label)
+        self.capture_label = QLabel()
+        self.capture_label.setWordWrap(True)
+        self.capture_label.setStyleSheet("padding: 0 12px;")
+        main.addWidget(self.capture_label)
         self.preview = SheetPreview()
         main.addWidget(self.preview, stretch=1)
         buttons = QHBoxLayout()
         self.save_button = QPushButton(SAVE_LABEL)
         self.save_button.clicked.connect(self.save_with_patient)
+        self.send_button = QPushButton("상쾌한캡처로 보내기")
+        self.send_button.clicked.connect(self.send_to_capture)
         self.open_button = QPushButton("결과지 열기")
         self.open_button.clicked.connect(self._open_sheet)
         folder_button = QPushButton("저장 폴더 열기")
         folder_button.clicked.connect(self._open_folder)
         buttons.addWidget(self.save_button)
+        buttons.addWidget(self.send_button)
         buttons.addWidget(self.open_button)
         buttons.addStretch(1)
         buttons.addWidget(folder_button)
@@ -166,16 +372,23 @@ class MainWindow(QMainWindow):
 
     def _build_orders(self) -> QGroupBox:
         box = QGroupBox("오늘 검사 오더")
-        box.setVisible(self._source is not None)
         layout = QVBoxLayout(box)
+        self.orders_table = QTableWidget(0, len(ORDER_COLUMNS))
+        self.orders_table.setHorizontalHeaderLabels(ORDER_COLUMNS)
+        self.orders_table.verticalHeader().setVisible(False)
+        self.orders_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.orders_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.orders_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        header = self.orders_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.orders_table.cellClicked.connect(self._order_chosen)
+        layout.addWidget(self.orders_table, stretch=1)
         self.orders_note = QLabel()
         self.orders_note.setWordWrap(True)
         self.orders_note.setStyleSheet("color: #666666;")
         layout.addWidget(self.orders_note)
-        self.orders_list = QListWidget()
-        self.orders_list.itemClicked.connect(self._order_chosen)
-        layout.addWidget(self.orders_list, stretch=1)
-        self.refresh_button = QPushButton("새로고침")
+        self.refresh_button = QPushButton("새로 읽기")
         self.refresh_button.clicked.connect(self.refresh_orders)
         layout.addWidget(self.refresh_button)
         return box
@@ -211,12 +424,38 @@ class MainWindow(QMainWindow):
         self.source_note = QLabel(NO_SOURCE_NOTE)
         self.source_note.setWordWrap(True)
         self.source_note.setStyleSheet("color: #666666;")
-        self.source_note.setVisible(self._source is None)
         layout.addWidget(self.source_note)
         for edit in (self.chart_edit, self.name_edit, self.birth_edit):
             edit.textEdited.connect(self._patient_edited)
         self.sex_combo.activated.connect(self._patient_edited)
         return box
+
+    # ----- settings -----------------------------------------------------------------------
+
+    def open_settings(self) -> None:
+        dialog = SettingsDialog(self, self._settings, self._background)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.apply_settings(dialog.settings())
+
+    def apply_settings(self, settings: Settings) -> None:
+        """Saves the settings and switches patient lookup and sending over to them."""
+        settings_file.save(settings, self._settings_directory)
+        if isinstance(self._source, Records):
+            self._source.close()
+        self._settings = settings
+        self._source = records_from_settings(settings)
+        self._show_source()
+        self._show_state()
+
+    def _show_source(self) -> None:
+        has_source = self._source is not None
+        self.orders_box.setVisible(has_source)
+        self._side_filler.setVisible(not has_source)
+        self.find_button.setVisible(has_source)
+        self.source_note.setVisible(not has_source)
+        self._orders = []
+        self.orders_table.setRowCount(0)
+        self.refresh_orders()
 
     # ----- patient ------------------------------------------------------------------------
 
@@ -238,49 +477,96 @@ class MainWindow(QMainWindow):
 
     def clear_patient(self) -> None:
         self.set_patient(Patient())
-        self.orders_list.clearSelection()
+        self.orders_table.clearSelection()
         self.chart_edit.setFocus()
 
     def find_patient(self) -> None:
         chart_no = self.chart_edit.text().strip()
         if self._source is None or not chart_no:
             return
-        try:
-            found = self._source.find(chart_no)
-        except Exception as error:  # whatever the records system raises must not close the window
-            self.form_note.setText(f"조회하지 못했습니다: {error}")
-            return
-        if found is None:
-            self.form_note.setText(f"차트번호 {chart_no} 환자를 찾지 못했습니다.")
-            return
-        self.set_patient(found)
+        source = self._source
+        self.form_note.setText("조회하는 중...")
+
+        def done(found, error) -> None:
+            if isinstance(error, LookupError):
+                self.form_note.setText(str(error))
+            elif error is not None:
+                self.form_note.setText(f"조회하지 못했습니다: {error}")
+            elif found is None:
+                self.form_note.setText(f"차트번호 {chart_no} 환자를 찾지 못했습니다.")
+            else:
+                self.form_note.setText("")
+                self._offer(found)
+
+        self._background(self, lambda: source.find(chart_no), done)
 
     def refresh_orders(self) -> None:
-        self.find_button.setVisible(self._source is not None)
-        self.orders_list.clear()
-        if self._source is None:
+        if self._source is None or self._loading_orders:
             return
-        try:
-            self._orders = self._source.todays_orders()
-        except Exception as error:  # whatever the records system raises must not close the window
-            self._orders = []
-            self.orders_note.setText(f"오더 목록을 가져오지 못했습니다: {error}")
-            return
-        self.orders_note.setText(
-            f"{len(self._orders)}명 · 환자를 누르면 아래에 채워집니다." if self._orders
-            else "오늘 임피던스 검사 오더가 없습니다."
-        )
+        source = self._source
+        self._loading_orders = True
+        if not self._orders:
+            self.orders_note.setText("오더 목록을 읽는 중...")
+
+        def done(orders, error) -> None:
+            self._loading_orders = False
+            if source is not self._source:
+                return
+            if error is not None:
+                self._orders = []
+                self.orders_table.setRowCount(0)
+                self.orders_note.setText(f"오더 목록을 가져오지 못했습니다: {error}")
+                return
+            self._orders = orders
+            self._show_orders()
+
+        self._background(self, source.todays_orders, done)
+
+    def _show_orders(self) -> None:
         today = self._now().date()
-        for order in self._orders:
+        done_charts = charts_tested_on(self._directory, today)
+        chosen = self.chart_edit.text().strip()
+        self.orders_table.setRowCount(len(self._orders))
+        for row, order in enumerate(self._orders):
             patient = order.patient
             age = patient.age_on(today)
-            who = "/".join(part for part in (patient.sex, f"{age}세" if age is not None else "") if part)
-            text = "  ".join(part for part in (order.time, patient.chart_no, patient.name,
-                                               f"({who})" if who else "", order.label) if part)
-            self.orders_list.addItem(QListWidgetItem(text))
+            who = " ".join(part for part in (f"{age}세" if age is not None else "", patient.sex) if part)
+            tested = patient.chart_no in done_charts
+            cells = (order.time, patient.chart_no, patient.name, who, order.room, "✓" if tested else "")
+            for column, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if not order.selectable:
+                    item.setFlags(Qt.ItemFlag.NoItemFlags)
+                if tested or not order.selectable:
+                    item.setForeground(DONE_INK)
+                self.orders_table.setItem(row, column, item)
+            if order.selectable and chosen and patient.chart_no == chosen:
+                self.orders_table.selectRow(row)
+        waiting = sum(1 for order in self._orders if order.selectable and order.patient.chart_no not in done_charts)
+        if self._orders:
+            self.orders_note.setText(
+                f"{len(self._orders)}명 (검사 전 {waiting}명) · {self._now():%H:%M:%S} 읽음 · 30초마다 다시 읽습니다")
+        else:
+            self.orders_note.setText(f"오늘 임피던스 검사 오더가 없습니다. · {self._now():%H:%M:%S} 읽음")
 
-    def _order_chosen(self, item: QListWidgetItem) -> None:
-        self.set_patient(self._orders[self.orders_list.row(item)].patient)
+    def _order_chosen(self, row: int, _column: int) -> None:
+        order = self._orders[row]
+        if order.selectable:
+            self._offer(order.patient)
+
+    def _offer(self, patient: Patient) -> None:
+        """Puts a patient from the records into the form once the operator confirms who it is."""
+        if self._confirm_patient(patient):
+            self.set_patient(patient)
+            self._select_order_row(patient.chart_no)
+        else:
+            self.orders_table.clearSelection()
+
+    def _select_order_row(self, chart_no: str) -> None:
+        self.orders_table.clearSelection()
+        for row, order in enumerate(self._orders):
+            if order.selectable and order.patient.chart_no == chart_no:
+                self.orders_table.selectRow(row)
 
     def _patient_edited(self, *_) -> None:
         self._patient_is_new = True
@@ -306,7 +592,7 @@ class MainWindow(QMainWindow):
         Attaching a patient to a result that has none needs no question. Replacing one
         patient with another could put the wrong name on a result, so that is confirmed first.
         """
-        if self._measurement is None or self._sheet is None:
+        if self._measurement is None or self._sheet is None or self._sending:
             return
         try:
             patient = self.patient()
@@ -315,12 +601,40 @@ class MainWindow(QMainWindow):
             return
         if patient.is_empty or patient == self._sheet_patient:
             return
-        if not self._sheet_patient.is_empty and not self._confirm(
-                f"직전 결과지는 {_who(self._sheet_patient)} 환자로 저장되어 있습니다.\n"
-                f"{_who(patient)} 환자의 결과로 바꿀까요?"):
-            return
+        if not self._sheet_patient.is_empty:
+            question = (f"직전 결과지는 {_who(self._sheet_patient)} 환자로 저장되어 있습니다.\n"
+                        f"{_who(patient)} 환자의 결과로 바꿀까요?")
+            if self._sent and self._sent.get("ok"):
+                question += (f"\n\n이 결과지는 이미 상쾌한캡처에 {_who(self._sheet_patient)} 환자로 들어가 있습니다. "
+                             "그쪽 사진은 상쾌한캡처에서 직접 지워야 합니다.")
+            if not self._confirm(question):
+                return
         delete_result(self._sheet)
         self._save(patient)
+
+    def send_to_capture(self) -> None:
+        """Sends the shown sheet to 상쾌한캡처, which checks the chart number and name against the records."""
+        if not self._can_send():
+            return
+        sheet, patient, tested_on, settings = self._sheet, self._sheet_patient, self._received_at.date(), self._settings
+        self._sending = True
+        self.capture_label.setText("상쾌한캡처로 보내는 중...")
+        self._show_state()
+
+        def done(outcome, error) -> None:
+            self._sending = False
+            if sheet == self._sheet:
+                self._sent = outcome if error is None else {"ok": False, "code": "error", "error": str(error), "retry": True}
+                self._show_capture()
+            self._show_state()
+            self._show_orders()
+
+        self._background(self, lambda: self._send(sheet, patient, tested_on, settings), done)
+
+    def _can_send(self) -> bool:
+        return (self._sheet is not None and not self._sending and self._settings.capture_ready
+                and bool(self._sheet_patient.chart_no and self._sheet_patient.name)
+                and not (self._sent and self._sent.get("ok")))
 
     def _measurement_received(self, measurement: Measurement) -> None:
         if measurement.left is None and measurement.right is None:
@@ -342,15 +656,21 @@ class MainWindow(QMainWindow):
         self._sheet = save_result(self._measurement, self._directory, self._received_at, patient)
         self._sheet_patient = patient
         self._patient_is_new = False
+        self._sent = None
         self.preview.show_sheet(self._sheet)
+        self._show_capture()
         self._show_state()
+        self._show_orders()
+        if self._settings.cap_on:
+            self.send_to_capture()
 
     # ----- display ------------------------------------------------------------------------
 
     def _show_state(self) -> None:
         try:
             patient = self.patient()
-            self.form_note.setText("")
+            if self.form_note.text().startswith(("생년월일", "없는 날짜")):
+                self.form_note.setText("")
         except ValueError as error:
             patient = Patient()
             self.form_note.setText(str(error))
@@ -358,6 +678,8 @@ class MainWindow(QMainWindow):
         saved_for = self._sheet_patient
         next_up = not patient.is_empty and self._patient_is_new
         self.open_button.setEnabled(has_result)
+        self.send_button.setVisible(self._settings.capture_ready)
+        self.send_button.setEnabled(self._can_send())
         self.save_button.setText(SAVE_LABEL)
         self.save_button.setEnabled(False)
         if not has_result:
@@ -380,10 +702,25 @@ class MainWindow(QMainWindow):
             text = f"✔ {_who(saved_for)} 환자 결과로 저장했습니다."
         else:
             self.save_button.setText(REPLACE_LABEL)
-            self.save_button.setEnabled(True)
+            self.save_button.setEnabled(not self._sending)
             text = (f"✔ 직전 결과는 {_who(saved_for)} 환자로 저장되어 있습니다. "
                     f"다음 검사는 {_who(patient)} 환자로 저장됩니다.")
         self.state_label.setText(text)
+
+    def _show_capture(self) -> None:
+        sent = self._sent
+        if sent is None:
+            text = ""
+            if self._sheet is not None and self._settings.capture_ready and not self._sheet_patient.is_empty \
+                    and not (self._sheet_patient.chart_no and self._sheet_patient.name):
+                text = "상쾌한캡처로 보내려면 차트번호와 이름이 모두 필요합니다."
+        elif sent.get("ok"):
+            again = " (이미 들어가 있던 결과지)" if sent.get("duplicate") else ""
+            text = f"✔ 상쾌한캡처에 저장했습니다{again}: {sent.get('imageDataName') or ''}"
+        else:
+            later = " 잠시 뒤 [상쾌한캡처로 보내기]를 눌러 다시 보낼 수 있습니다." if sent.get("retry") else ""
+            text = f"⚠ 상쾌한캡처에 보내지 못했습니다: {sent.get('error')} ({sent.get('code')}).{later}"
+        self.capture_label.setText(text)
 
     def _open_sheet(self) -> None:
         if self._sheet is not None:
@@ -397,12 +734,16 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(self, "환자 바꾸기", question)
         return answer == QMessageBox.StandardButton.Yes
 
+    def _ask_patient(self, patient: Patient) -> bool:
+        return PatientConfirm(self, patient, self._now().date()).exec() == QDialog.DialogCode.Accepted
+
 
 def run(args) -> int:
     app = QApplication.instance() or QApplication(sys.argv[:1])
     prepare()
-    window = MainWindow(Path(args.out))
-    port = args.port or _pick_port(QSettings("TSM300", "TSM300"))
+    settings = settings_file.load()
+    window = MainWindow(Path(args.out), settings)
+    port = args.port or _pick_port(settings)
     worker = None
     if port:
         worker = SerialWorker(port, args.baud)
@@ -422,19 +763,26 @@ def run(args) -> int:
     return code
 
 
-def _pick_port(settings: QSettings) -> str | None:
+def _pick_port(settings: Settings) -> str | None:
     """The port used last time if it is still there, otherwise the first USB serial adapter."""
     ports = available_ports()
     names = [port.device for port in ports]
-    remembered = settings.value("port")
-    if remembered in names:
-        return remembered
+    if settings.port in names:
+        return settings.port
     usb = [port.device for port in ports if "USB" in (port.hwid or "").upper()]
     chosen = (usb or names or [None])[0]
     if chosen:
-        settings.setValue("port", chosen)
+        settings.port = chosen
+        settings_file.save(settings)
     return chosen
 
 
 def _who(patient: Patient) -> str:
     return " ".join(part for part in (patient.name, f"({patient.chart_no})" if patient.chart_no else "") if part)
+
+
+def _details(patient: Patient, today) -> str:
+    age = patient.age_on(today)
+    sex_age = " ".join(part for part in (patient.sex, f"{age}세" if age is not None else "") if part)
+    birth = patient.birth_date.isoformat() if patient.birth_date else ""
+    return " · ".join(part for part in (birth, sex_age) if part)

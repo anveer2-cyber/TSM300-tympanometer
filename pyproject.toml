@@ -7,7 +7,12 @@ name = "tsm300"
 dynamic = ["version"]
 description = "Receive Oscilla TSM-300 tympanometer results and save them as printable result sheets"
 requires-python = ">=3.9"
-dependencies = ["pyserial>=3.5", "matplotlib>=3.6", "PySide6-Essentials>=6.5"]
+dependencies = [
+    "pyserial>=3.5",
+    "matplotlib>=3.6",
+    "PySide6-Essentials>=6.5",
+    "pyodbc>=5; sys_platform == 'win32'",
+]
 
 [project.optional-dependencies]
 dev = ["pytest"]
