@@ -14,7 +14,7 @@ from tsm300 import cli
 
 pty = pytest.importorskip("pty")
 
-ID_KEY = b"TSM300 v1.02\r\n"
+ID_KEY = b"ID TSM-300 SCREENING".ljust(76, b"\x00") + b"\n\r" + b"KEY6349".ljust(76, b"\x00") + b"\n\r"
 RESULT = bytes(range(200))
 
 
@@ -60,11 +60,11 @@ def test_scan_finds_the_baud_then_capture_records_a_noted_burst(tmp_path, monkey
     )
     threading.Thread(target=_send_when_capturing, args=(device, tmp_path), daemon=True).start()
 
-    code, output, directory = run_wizard(tmp_path, ["--port", device.port], answers)
+    code, output, directory = run_wizard(tmp_path, ["--port", device.port, "--scan"], answers)
 
     assert code == 0
     assert "9600 bps 에서 글자로 읽히는 데이터를 받았습니다" in output
-    assert "54 53 4D 33 30 30" in output
+    assert "49 44 20 54 53 4D 2D 33 30 30" in output
     summary = json.loads((directory / "session.json").read_text(encoding="utf-8"))
     assert summary["baud"] == 9600
     assert summary["scan"] == [{"baud": 9600, "file": "scan_9600.bin", "length": len(ID_KEY)}]
@@ -77,13 +77,13 @@ def test_scan_finds_the_baud_then_capture_records_a_noted_burst(tmp_path, monkey
         assert {"session.json", "raw.bin", "burst_001.bin", "scan_9600.bin"} <= set(archive.namelist())
 
 
-def test_known_baud_skips_the_scan_and_ignores_power_noise(tmp_path):
+def test_default_run_skips_the_scan_and_ignores_power_noise(tmp_path):
     device = Device()
     device.send_after(0.3, b"\x00")
     device.send_after(1.2, RESULT)
     answers = Answers(["q"])
 
-    code, output, directory = run_wizard(tmp_path, ["--port", device.port, "--baud", "9600"], answers)
+    code, output, directory = run_wizard(tmp_path, ["--port", device.port], answers)
 
     assert code == 0
     assert "통신 속도를 찾습니다" not in output

@@ -17,6 +17,7 @@ from . import __version__
 from .analyze import ascii_preview, guess_baud, hexdump, is_line_noise, looks_like_text, printable_ratio
 from .capture import CaptureEngine, SessionWriter, listen_once
 
+DEFAULT_BAUD = 9600
 SCAN_BAUDS = (9600, 19200, 38400, 57600, 115200, 4800, 2400, 1200)
 SCAN_WAIT = 25.0
 SCAN_SETTLE = 4.0
@@ -176,7 +177,7 @@ def run(args, console: Console, port_opener=open_port, now=datetime.now) -> int:
     if not port:
         return 1
     try:
-        ser = port_opener(port, args.baud or SCAN_BAUDS[0])
+        ser = port_opener(port, args.baud)
     except serial.SerialException as exc:
         console.say(f"{port} 포트를 열 수 없습니다: {exc}")
         console.say("다른 프로그램이 이 포트를 쓰고 있지 않은지 확인해 주세요.")
@@ -191,7 +192,7 @@ def run(args, console: Console, port_opener=open_port, now=datetime.now) -> int:
         "idle_gap": args.idle_gap,
     })
     try:
-        baud = args.baud or scan(console, ser, writer)
+        baud = scan(console, ser, writer) if args.scan else args.baud
         if baud is None:
             return 1
         ser.baudrate = baud
@@ -216,7 +217,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--list", action="store_true", help="시리얼 포트 목록만 출력")
     parser.add_argument("--port", help="사용할 포트 (예: COM3). 생략하면 목록에서 고릅니다")
-    parser.add_argument("--baud", type=int, help="통신 속도. 생략하면 자동으로 찾습니다")
+    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help=f"통신 속도 (기본: {DEFAULT_BAUD})")
+    parser.add_argument("--scan", action="store_true", help="통신 속도를 모를 때 자동으로 찾습니다")
     parser.add_argument("--out", default="captures", help="저장할 폴더 (기본: captures)")
     parser.add_argument("--idle-gap", type=float, default=1.5,
                         help="이 시간(초) 동안 조용하면 한 번의 전송이 끝난 것으로 봅니다")

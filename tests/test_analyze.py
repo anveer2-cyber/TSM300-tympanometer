@@ -21,6 +21,15 @@ def test_looks_like_text_needs_enough_printable_bytes():
     assert not looks_like_text(b"\x02\x10\x80\xfe\x00")
 
 
+def test_looks_like_text_accepts_the_nul_padded_identification_key():
+    key = b"\x00" + b"ID TSM-300 SCREENING".ljust(76, b"\x00") + b"\n\r" + b"KEY6349".ljust(76, b"\x00") + b"\n\r"
+    assert looks_like_text(key)
+    read_at_19200 = bytes.fromhex("008698600018661e661e66861e0000009898e680869866606686988698f8987e") + bytes(40)
+    read_at_38400 = bytes.fromhex("0078800000008000787880787880 78f878f8808000800080") + bytes(40)
+    assert not looks_like_text(read_at_19200)
+    assert not looks_like_text(read_at_38400)
+
+
 def test_line_noise_is_only_a_stray_zero_or_ff():
     assert is_line_noise(b"\x00")
     assert is_line_noise(b"\xff\x00")

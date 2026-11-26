@@ -18,7 +18,9 @@ def printable_ratio(data: bytes) -> float:
 
 
 def looks_like_text(data: bytes) -> bool:
-    return len(data) >= 4 and printable_ratio(data) >= 0.9
+    """True for readable text; the TSM-300 pads its fixed-width lines with NUL bytes."""
+    visible = data.replace(b"\x00", b"")
+    return len(visible) >= 4 and printable_ratio(visible) >= 0.9
 
 
 def is_line_noise(data: bytes) -> bool:
