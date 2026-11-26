@@ -8,12 +8,9 @@ import time
 import zipfile
 from datetime import datetime
 
-import pytest
-
+from conftest import needs_pty, pty
 from tsm300 import cli, wizard
 from tsm300.console import Console
-
-pty = pytest.importorskip("pty")
 
 ID_KEY = b"ID TSM-300 SCREENING".ljust(76, b"\x00") + b"\n\r" + b"KEY6349".ljust(76, b"\x00") + b"\n\r"
 RESULT = bytes(range(200))
@@ -51,6 +48,7 @@ def run_wizard(tmp_path, argv, answers):
     return code, out.getvalue(), tmp_path / "20261126_203015"
 
 
+@needs_pty
 def test_scan_finds_the_baud_then_capture_records_a_noted_burst(tmp_path, monkeypatch):
     monkeypatch.setattr(wizard, "SCAN_SETTLE", 0.3)
     device = Device()
@@ -78,6 +76,7 @@ def test_scan_finds_the_baud_then_capture_records_a_noted_burst(tmp_path, monkey
         assert {"session.json", "raw.bin", "burst_001.bin", "scan_9600.bin"} <= set(archive.namelist())
 
 
+@needs_pty
 def test_default_run_skips_the_scan_and_ignores_power_noise(tmp_path):
     device = Device()
     device.send_after(0.3, b"\x00")

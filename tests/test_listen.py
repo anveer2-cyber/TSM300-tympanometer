@@ -11,6 +11,7 @@ import pytest
 import serial
 from PIL import Image
 
+from conftest import needs_pty, pty
 from tsm300 import cli, listen
 from tsm300.console import Console, open_port
 from tsm300.protocol import parse_message
@@ -128,10 +129,11 @@ def test_decode_command_rejects_an_unreadable_birth_date(tmp_path, capsys):
     assert list(tmp_path.iterdir()) == []
 
 
+@needs_pty
 class TestOnASerialPort:
     """End to end over a pseudo-terminal standing in for the device."""
 
-    pty = pytest.importorskip("pty")
+    pty = pty
 
     def open_device(self):
         master, slave = self.pty.openpty()

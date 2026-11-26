@@ -22,13 +22,16 @@ def test_icon_holds_every_size_windows_asks_for():
         assert picture.size == (256, 256)
 
 
-def test_icon_is_set_on_the_program_and_shown_on_its_windows():
+def test_icon_loads_as_a_window_icon():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PySide6.QtWidgets")
     from PySide6.QtGui import QIcon
+    from PySide6.QtWidgets import QApplication
 
+    application = QApplication.instance() or QApplication([])  # Qt refuses to make pictures without one
     icon = QIcon(str(ICON))
     assert not icon.isNull() and not icon.pixmap(32, 32).isNull()
+    assert application is QApplication.instance()
 
 
 @pytest.mark.skipif(ON_WINDOWS, reason="other systems cannot make a Windows shortcut")

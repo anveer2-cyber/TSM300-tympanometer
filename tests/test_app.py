@@ -16,6 +16,7 @@ import shiboken6  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+from conftest import needs_pty, pty  # noqa: E402
 from fakes import KEY, CaptureReceiver  # noqa: E402
 from tsm300 import settings as settings_file  # noqa: E402
 from tsm300.app import REPLACE_LABEL, SAVE_LABEL, MainWindow, SettingsDialog, run_in_background  # noqa: E402
@@ -541,10 +542,11 @@ def test_applying_settings_saves_them_and_switches_lookup_on(qapp, results):
 
 # ----- the serial port ---------------------------------------------------------------------
 
+@needs_pty
 class TestOnASerialPort:
     """The background reader and the program's start-up, against a pseudo-terminal."""
 
-    pty = pytest.importorskip("pty")
+    pty = pty
 
     def test_worker_reads_the_port_and_hands_results_to_the_window(self, qapp, results):
         from tsm300.app import SerialWorker
