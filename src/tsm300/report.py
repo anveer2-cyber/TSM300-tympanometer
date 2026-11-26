@@ -42,9 +42,10 @@ ROW_RULE = "#e7e7e7"
 RIGHT_EAR = "#ec4647"
 LEFT_EAR = "#257de0"
 
-# The box the TSM-300 draws on its own screen, read off the display's pixel rows.
+# The box the TSM-300 draws on its own screen. The screen's rows are too coarse to tell 0.2 from 0.25 ml,
+# so the lower edge was measured on printouts of the maker's own program (see docs/device-notes.md).
 NORMAL_PRESSURE = (-150, 100)
-NORMAL_COMPLIANCE = (0.2, 1.5)
+NORMAL_COMPLIANCE = (0.25, 1.5)
 
 # 90% ranges of Margolis & Heller (1987), rounded as in the ASHA (1990) screening guidelines.
 # The device gives no range for these two. The children were three to five years old.
