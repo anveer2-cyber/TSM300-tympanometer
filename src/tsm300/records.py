@@ -25,7 +25,7 @@ class Records:
     def __init__(self, backend, today: Callable[[], date] = date.today) -> None:
         self._backend = backend
         self._today = today
-        self._uncertain: set[str] = set()
+        self._internal: dict[str, str] = {}
 
     def find(self, chart_no: str) -> Patient | None:
         """The patient with this chart number. Raises LookupError when two patients share it."""
@@ -47,21 +47,21 @@ class Records:
             for row in rows
         ]
 
-    def uncertain(self, chart_no: str) -> bool:
-        """True when the records gave this chart number without tying it to one patient record.
+    def internal_number(self, chart_no: str) -> str:
+        """The records' internal number for a chart number looked up earlier, or "" when not known.
 
-        The relay server leaves the internal number blank on purpose in that case, so that
-        nothing is filed under a number that might belong to someone else.
+        It is never sent anywhere: 상쾌한캡처 is addressed by the chart number on screen. It only
+        serves to check afterwards that the sheet was filed under the same patient.
         """
-        return chart_no in self._uncertain
+        return self._internal.get(chart_no, "")
 
     def _patient(self, found: dict) -> Patient:
         patient = to_patient(found)
         if patient.chart_no:
             if found.get("code") is None:
-                self._uncertain.add(patient.chart_no)
+                self._internal.pop(patient.chart_no, None)
             else:
-                self._uncertain.discard(patient.chart_no)
+                self._internal[patient.chart_no] = str(found["code"]).strip()
         return patient
 
     def check(self) -> str:
@@ -112,22 +112,35 @@ def error_text(error: Exception) -> str:
     return text
 
 
-def send_sheet(sheet: Path, patient: Patient, tested_on: date, settings: Settings,
+def send_sheet(sheet: Path, patient: Patient, tested_on: date, settings: Settings, internal_number: str = "",
                send: Callable[..., dict] = links.save_to_entcapture, now: Callable[[], datetime] = datetime.now) -> dict:
     """Sends the sheet to 상쾌한캡처 and notes the outcome in the result's JSON file.
 
-    Returns the outcome: ``{"ok": True, "imageDataName": ...}`` or ``{"ok": False, "code": ..., "error": ..., "retry": ...}``.
+    The receiver is given the chart number on screen, the name and the birth date, and checks
+    them against the records itself. Returns ``{"ok": True, "imageDataName": ..., "chartId": ...}``
+    or ``{"ok": False, "code": ..., "error": ..., "retry": ...}``. When ``internal_number`` is
+    known and the receiver filed the sheet under a different one, the outcome also carries
+    ``"expected_chartId"``.
     """
     details = {"chart": patient.chart_no, "name": patient.name,
                "birth": patient.birth_date.isoformat() if patient.birth_date else ""}
     try:
         reply = send(str(sheet), details, tested_on, EXAM_KIND, url=settings.cap_url, key=settings.cap_key)
         outcome = {"ok": True, "duplicate": bool(reply.get("duplicate")), "id": reply.get("id"),
-                   "imageDataName": reply.get("imageDataName")}
+                   "imageDataName": reply.get("imageDataName"), "chartId": str(reply.get("chartId") or "")}
+        if internal_number and outcome["chartId"] and not _same_number(internal_number, outcome["chartId"]):
+            outcome["expected_chartId"] = internal_number
     except links.SendError as error:
         outcome = {"ok": False, "code": error.code, "error": str(error), "retry": error.retry}
     _note_outcome(sheet.with_suffix(".json"), dict(outcome, at=now().isoformat(timespec="seconds")))
     return outcome
+
+
+def _same_number(one: str, other: str) -> bool:
+    one, other = one.strip(), other.strip()
+    if one.isdigit() and other.isdigit():
+        return int(one) == int(other)
+    return one == other
 
 
 def charts_tested_on(directory: Path, day: date) -> set[str]:

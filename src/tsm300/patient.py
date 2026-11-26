@@ -67,8 +67,8 @@ class PatientSource(Protocol):
     def todays_orders(self) -> list[Order]:
         """Patients with a tympanometry order today."""
 
-    def uncertain(self, chart_no: str) -> bool:
-        """True when the records could not tie this chart number to a single patient record."""
+    def internal_number(self, chart_no: str) -> str:
+        """The records' own number for a chart number looked up earlier, or "" when not known."""
 
 
 def parse_sex(text: str) -> str:

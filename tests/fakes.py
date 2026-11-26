@@ -102,7 +102,8 @@ class CaptureReceiver:
         number = len(self.received)
         suffix = "" if number == 1 else f"_{number}"
         day = fields["date"].replace("-", "")
-        return 200, {"ok": True, "duplicate": duplicate, "id": f"{number:032d}", "chartNo": chart,
+        return 200, {"ok": True, "duplicate": duplicate, "id": f"{number:032d}", "chartId": "66000",
+                     "chartNo": chart, "day": fields["date"], "exam": "중이검사", "fileName": "중이검사.jpg",
                      "imageDataName": f"66000_{day}_중이검사{suffix}.jpg", "message": "저장했습니다"}
 
     def close(self) -> None:

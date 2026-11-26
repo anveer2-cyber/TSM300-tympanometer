@@ -100,21 +100,23 @@ def test_relay_server_is_asked_at_its_tsm300_addresses_with_the_tsm300_token(rel
     assert [order.selectable for order in orders] == [True, True, False]
 
 
-def test_a_blank_internal_number_from_the_relay_marks_the_chart_as_uncertain(relay):
+def test_internal_number_is_remembered_from_the_relay_lookup_when_it_gives_one(relay):
     records = Records(links.YejinServer(relay.url, TOKEN), today=lambda: DAY)
+    assert records.internal_number("00512") == ""
 
-    assert not records.uncertain("12345")
-    assert records.find("12345") == Patient("12345", "김하나", "여", date(1980, 1, 31))
-
-    assert records.uncertain("12345")
-    assert records.find("00512") and not records.uncertain("00512")
-
-
-def test_the_records_database_always_ties_a_chart_to_one_record(records):
     records.find("00512")
+    records.find("12345")
+
+    assert records.internal_number("00512") == "512"
+    assert records.internal_number("12345") == ""
+
+
+def test_internal_number_is_remembered_from_the_records_database(records):
     records.todays_orders()
 
-    assert not records.uncertain("00512") and not records.uncertain("24680")
+    assert records.internal_number("00512") == "66000"
+    assert records.internal_number("24680") == "66002"
+    assert records.internal_number("99999") == ""
 
 
 def test_relay_server_refusals_are_passed_on_in_its_own_words(relay):
@@ -153,7 +155,7 @@ def test_sheet_is_sent_as_a_tympanometry_result_and_the_outcome_is_noted(tmp_pat
     outcome = send_sheet(sheet, HONG, DAY, settings, now=lambda: datetime(2026, 11, 26, 21, 13))
 
     assert outcome == {"ok": True, "duplicate": False, "id": "0" * 31 + "1",
-                       "imageDataName": "66000_20261126_중이검사.jpg"}
+                       "imageDataName": "66000_20261126_중이검사.jpg", "chartId": "66000"}
     (sent,) = receiver.received
     assert (sent["chart"], sent["date"], sent["exam"], sent["name"], sent["birth"]) == \
         ("00512", "2026-11-26", "tymp", "홍길동", "1975-03-04")
@@ -162,6 +164,36 @@ def test_sheet_is_sent_as_a_tympanometry_result_and_the_outcome_is_noted(tmp_pat
     noted = json.loads(sheet.with_suffix(".json").read_text(encoding="utf-8"))["capture"]
     assert noted == [dict(outcome, at="2026-11-26T21:13:00")]
     assert "홍길동" not in json.dumps(noted, ensure_ascii=False)
+
+
+def test_only_the_chart_number_on_screen_is_sent_never_the_internal_number(tmp_path, receiver):
+    sheet = save_result(BOTH, tmp_path, datetime(2026, 11, 26, 21, 12, 5), HONG)
+
+    send_sheet(sheet, HONG, DAY, Settings(cap_url=receiver.url, cap_key=KEY), internal_number="66000")
+
+    (sent,) = receiver.received
+    assert sent["chart"] == "00512"
+    assert "66000" not in [value for name, value in sent.items() if name != "file"]
+
+
+@pytest.mark.parametrize("internal_number, flagged", [("66000", False), ("066000", False), ("", False), ("512", True)])
+def test_a_sheet_filed_under_another_internal_number_than_the_lookup_gave_is_flagged(
+        tmp_path, receiver, internal_number, flagged):
+    sheet = save_result(BOTH, tmp_path, datetime(2026, 11, 26, 21, 12, 5), HONG)
+
+    outcome = send_sheet(sheet, HONG, DAY, Settings(cap_url=receiver.url, cap_key=KEY), internal_number)
+
+    assert outcome["ok"] and outcome["chartId"] == "66000"
+    assert outcome.get("expected_chartId") == ("512" if flagged else None)
+
+
+def test_server_side_failures_may_be_sent_again_but_refusals_may_not():
+    assert links.SendError("save_failed", "저장 실패", 500).retry
+    assert links.SendError("http503", "Service Unavailable", 503).retry
+    assert links.SendError("connect", "연결 안 됨").retry
+    assert not links.SendError("name_mismatch", "이름이 다릅니다", 409).retry
+    assert not links.SendError("patient_not_found", "환자 없음", 404).retry
+    assert not links.SendError("bad_date", "날짜 오류", 400).retry
 
 
 def test_sending_the_same_sheet_again_is_reported_as_a_duplicate(tmp_path, receiver):

@@ -337,7 +337,7 @@ class SendError(Exception):
 
     @property
     def retry(self):
-        return self.code in RETRY
+        return self.code in RETRY or self.status in (500, 503)     # 같은 파일은 두 번 들어가지 않으므로 다시 보내도 됨
 
 
 def _json(b):

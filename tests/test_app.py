@@ -38,10 +38,9 @@ SENDING = Settings(cap_on=True, cap_url="192.0.2.1", cap_key="key")
 class FakeRecords:
     """A stand-in for the clinic's records system."""
 
-    def __init__(self, failing=False, delay=0.0, uncertain_charts=()):
+    def __init__(self, failing=False, delay=0.0):
         self.failing = failing
         self.delay = delay
-        self.uncertain_charts = set(uncertain_charts)
 
     def find(self, chart_no):
         time.sleep(self.delay)
@@ -58,8 +57,8 @@ class FakeRecords:
         return [Order(KIM, "09:10", "고막운동성계측", "진료1실"), Order(LEE, "09:25", "고막운동성계측", "진료2실"),
                 Order(UNKNOWN, "09:40", "고막운동성계측", "진료1실")]
 
-    def uncertain(self, chart_no):
-        return chart_no in self.uncertain_charts
+    def internal_number(self, chart_no):
+        return {"12345": "66001", "67890": "66002"}.get(chart_no, "")
 
 
 class FakeSender:
@@ -67,10 +66,13 @@ class FakeSender:
 
     def __init__(self):
         self.sent = []
-        self.outcome = {"ok": True, "duplicate": False, "id": "1", "imageDataName": "66001_20261126_중이검사.jpg"}
+        self.internal_numbers = []
+        self.outcome = {"ok": True, "duplicate": False, "id": "1", "imageDataName": "66001_20261126_중이검사.jpg",
+                        "chartId": "66001"}
 
-    def __call__(self, sheet, patient, tested_on, settings):
+    def __call__(self, sheet, patient, tested_on, settings, internal_number=""):
         self.sent.append((sheet.name, patient, tested_on))
+        self.internal_numbers.append(internal_number)
         return dict(self.outcome)
 
 
@@ -474,21 +476,38 @@ def test_moving_a_sent_result_to_another_patient_warns_that_the_sent_copy_stays(
     assert [patient for _, patient, _ in sender.sent] == [KIM, LEE]
 
 
-def test_nothing_is_sent_for_a_chart_the_records_could_not_tie_to_one_patient(qapp, results):
+def test_internal_number_from_the_lookup_goes_along_only_for_checking(qapp, results):
     sender = FakeSender()
-    window = open_window(qapp, results, settings=SENDING, send=sender, source=FakeRecords(uncertain_charts={"12345"}))
+    window = open_window(qapp, results, settings=SENDING, send=sender, source=FakeRecords())
     window.orders_table.cellClicked.emit(0, 0)
 
     window.handle_event(BOTH)
 
-    assert sender.sent == []
-    assert "20261126_211205_12345.jpg" in saved(results)
-    assert "한 명으로 확정하지 못해 상쾌한캡처로 보내지 않습니다" in window.capture_label.text()
-    assert not window.send_button.isEnabled()
+    assert sender.internal_numbers == ["66001"]
+    assert window.capture_label.text().startswith("✔ 상쾌한캡처에 저장했습니다")
 
-    window.orders_table.cellClicked.emit(1, 0)
-    window.handle_event(LEFT_ONLY)
-    assert [patient for _, patient, _ in sender.sent] == [LEE]
+
+def test_typed_in_patients_are_sent_without_an_internal_number(qapp, results):
+    sender = FakeSender()
+    window = open_window(qapp, results, settings=SENDING, send=sender)
+    window.set_patient(KIM)
+
+    window.handle_event(BOTH)
+
+    assert sender.internal_numbers == [""]
+
+
+def test_a_sheet_filed_under_a_different_patient_record_is_pointed_out(qapp, results):
+    sender = FakeSender()
+    sender.outcome = dict(sender.outcome, chartId="66009", expected_chartId="66001")
+    window = open_window(qapp, results, settings=SENDING, send=sender, source=FakeRecords())
+    window.orders_table.cellClicked.emit(0, 0)
+
+    window.handle_event(BOTH)
+
+    text = window.capture_label.text()
+    assert text.startswith("⚠ 상쾌한캡처에 저장했지만 확인이 필요합니다")
+    assert "66001" in text and "66009" in text
 
 
 def test_sheet_reaches_a_receiver_over_the_network(qapp, results):

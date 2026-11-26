@@ -614,7 +614,7 @@ class MainWindow(QMainWindow):
                         f"{_who(patient)} 환자의 결과로 바꿀까요?")
             if self._sent and self._sent.get("ok"):
                 question += (f"\n\n이 결과지는 이미 상쾌한캡처에 {_who(self._sheet_patient)} 환자로 들어가 있습니다. "
-                             "그쪽 사진은 상쾌한캡처에서 직접 지워야 합니다.")
+                             "그쪽 것은 상쾌한캡처 사진 이력에서 '중이검사' 카드를 오른쪽 클릭해 [삭제…]로 지워 주세요.")
             if not self._confirm(question):
                 return
         delete_result(self._sheet)
@@ -625,6 +625,7 @@ class MainWindow(QMainWindow):
         if not self._can_send():
             return
         sheet, patient, tested_on, settings = self._sheet, self._sheet_patient, self._received_at.date(), self._settings
+        internal_number = self._source.internal_number(patient.chart_no) if self._source is not None else ""
         self._sending = True
         self.capture_label.setText("상쾌한캡처로 보내는 중...")
         self._show_state()
@@ -637,17 +638,12 @@ class MainWindow(QMainWindow):
             self._show_state()
             self._show_orders()
 
-        self._background(self, lambda: self._send(sheet, patient, tested_on, settings), done)
+        self._background(self, lambda: self._send(sheet, patient, tested_on, settings, internal_number), done)
 
     def _can_send(self) -> bool:
         return (self._sheet is not None and not self._sending and self._settings.capture_ready
                 and bool(self._sheet_patient.chart_no and self._sheet_patient.name)
-                and not self._identity_uncertain()
                 and not (self._sent and self._sent.get("ok")))
-
-    def _identity_uncertain(self) -> bool:
-        """True when the records system did not tie the saved sheet's chart number to one patient."""
-        return self._source is not None and self._source.uncertain(self._sheet_patient.chart_no)
 
     def _measurement_received(self, measurement: Measurement) -> None:
         if measurement.left is None and measurement.right is None:
@@ -728,9 +724,9 @@ class MainWindow(QMainWindow):
                 pass
             elif not (self._sheet_patient.chart_no and self._sheet_patient.name):
                 text = "상쾌한캡처로 보내려면 차트번호와 이름이 모두 필요합니다."
-            elif self._identity_uncertain():
-                text = ("⚠ 전자차트에서 이 차트번호의 환자를 한 명으로 확정하지 못해 상쾌한캡처로 보내지 않습니다. "
-                        "결과지는 저장했으니 상쾌한캡처에서 직접 넣어 주세요.")
+        elif sent.get("ok") and sent.get("expected_chartId"):
+            text = (f"⚠ 상쾌한캡처에 저장했지만 확인이 필요합니다: 조회한 환자의 내부번호는 {sent['expected_chartId']} 인데 "
+                    f"상쾌한캡처는 {sent.get('chartId')} 환자로 저장했습니다. 상쾌한캡처에서 맞는 환자인지 봐 주세요.")
         elif sent.get("ok"):
             again = " (이미 들어가 있던 결과지)" if sent.get("duplicate") else ""
             text = f"✔ 상쾌한캡처에 저장했습니다{again}: {sent.get('imageDataName') or ''}"
