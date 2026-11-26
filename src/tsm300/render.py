@@ -10,6 +10,7 @@ import matplotlib
 from matplotlib import font_manager
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpecFromSubplotSpec
+from matplotlib.patches import Rectangle
 
 from .protocol import (
     REFLEX_FREQUENCIES, REFLEX_POINTS, EarResult, Measurement, tympanogram_pressures,
@@ -22,6 +23,10 @@ GRIDLINE = "#e7e7e7"
 AXIS = "#c2c2c2"
 RIGHT_EAR = "#ec4647"
 LEFT_EAR = "#257de0"
+
+# The box the TSM-300 draws on its own screen, read off the display's pixel rows.
+NORMAL_PRESSURE = (-150, 100)
+NORMAL_COMPLIANCE = (0.2, 1.5)
 
 _KOREAN_FONTS = ("Malgun Gothic", "Apple SD Gothic Neo", "NanumGothic", "Noto Sans CJK KR", "Noto Sans KR")
 
@@ -36,6 +41,7 @@ _KOREAN = {
     "compliance": "컴플라이언스",
     "width": "폭",
     "reflex": "등골근 반사 (ml)",
+    "normal_range": "정상 범위",
     "not_measured": "측정 없음",
     "no_reflex": "반사 검사 없음",
 }
@@ -50,6 +56,7 @@ _ENGLISH = {
     "compliance": "Compliance",
     "width": "Width",
     "reflex": "Acoustic reflex (ml)",
+    "normal_range": "Normal range",
     "not_measured": "Not measured",
     "no_reflex": "No reflex test",
 }
@@ -116,6 +123,12 @@ def _draw_tympanogram(axes, ear: EarResult, color: str, labels: dict) -> None:
     axes.set_yticks(range(0, int(top) + 1))
     _style_axes(axes)
     axes.axhline(0, color=AXIS, linewidth=1, zorder=1)
+    (left, right), (bottom, upper) = NORMAL_PRESSURE, NORMAL_COMPLIANCE
+    axes.add_patch(Rectangle(
+        (left, bottom), right - left, upper - bottom, zorder=1.5,
+        facecolor=(0.1, 0.1, 0.1, 0.04), edgecolor=AXIS, linewidth=1,
+    ))
+    axes.text(left + 5, upper - 0.05, labels["normal_range"], fontsize=9, color=INK_SECONDARY, va="top")
     axes.fill_between(pressures, curve, 0, color=color, alpha=0.10, linewidth=0, zorder=2)
     axes.plot(pressures, curve, color=color, linewidth=2, solid_capstyle="round", solid_joinstyle="round", zorder=3)
     axes.plot(
