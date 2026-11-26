@@ -42,6 +42,15 @@ class Patient:
             "birth_date": self.birth_date.isoformat() if self.birth_date else None,
         }
 
+    @classmethod
+    def from_dict(cls, saved: dict) -> Patient:
+        """Rebuilds a patient from ``to_dict``; an unreadable birth date is dropped rather than refused."""
+        try:
+            birth_date = date.fromisoformat(saved.get("birth_date") or "")
+        except ValueError:
+            birth_date = None
+        return cls(saved.get("chart_no") or "", saved.get("name") or "", saved.get("sex") or "", birth_date)
+
 
 @dataclass(frozen=True)
 class Order:

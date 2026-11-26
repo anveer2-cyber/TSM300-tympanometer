@@ -684,3 +684,183 @@ def test_unexpected_errors_are_logged_and_shown_when_there_is_no_console(qapp, t
     log = (tmp_path / "settings" / "error.log").read_text(encoding="utf-8")
     assert "ValueError: 깨진 결과" in log and "Traceback" in log
     assert "깨진 결과" in shown[0] and "error.log" in shown[0]
+
+
+# ----- memo and earlier results ------------------------------------------------------------
+
+def note_of(results, stem):
+    return json.loads((results / f"{stem}.json").read_text(encoding="utf-8"))["note"]
+
+
+def test_memo_can_only_be_written_once_a_result_is_shown(qapp, results):
+    window = open_window(qapp, results)
+    assert not window.note_edit.isEnabled() and not window.note_button.isEnabled()
+
+    window.set_patient(KIM)
+    window.handle_event(BOTH)
+
+    assert window.note_edit.isEnabled() and not window.note_button.isEnabled()
+    window.note_edit.setPlainText("오른쪽 프로브 밀착이 어려웠음")
+    assert window.note_button.isEnabled()
+
+
+def test_saving_a_memo_prints_it_on_the_sheet_of_the_same_patient(qapp, results):
+    window = open_window(qapp, results)
+    window.set_patient(KIM)
+    window.handle_event(BOTH)
+    before = (results / "20261126_211205_12345.jpg").read_bytes()
+
+    window.note_edit.setPlainText("  오른쪽 프로브 밀착이 어려웠음  ")
+    window.note_button.click()
+
+    assert saved(results) == ["20261126_211205_12345.bin", "20261126_211205_12345.jpg", "20261126_211205_12345.json"]
+    assert note_of(results, "20261126_211205_12345") == "오른쪽 프로브 밀착이 어려웠음"
+    assert (results / "20261126_211205_12345.jpg").read_bytes() != before
+    assert not window.note_button.isEnabled()
+    assert window.state_label.text() == "✔ 김하나 (12345) 환자 결과로 저장했습니다."
+
+
+def test_a_memo_saved_while_the_next_patient_is_chosen_stays_with_the_shown_result(qapp, results):
+    window = open_window(qapp, results)
+    window.set_patient(KIM)
+    window.handle_event(BOTH)
+    window.set_patient(LEE)
+
+    window.note_edit.setPlainText("김하나 환자 메모")
+    window.note_button.click()
+
+    assert note_of(results, "20261126_211205_12345") == "김하나 환자 메모"
+    assert "다음 검사는 이두리 (67890) 환자로" in window.state_label.text()
+
+    window.handle_event(LEFT_ONLY)
+    assert note_of(results, "20261126_211205_67890") == ""
+    assert window.note_edit.toPlainText() == ""
+
+
+def test_a_memo_left_unsaved_is_kept_with_its_result_when_the_next_one_arrives(qapp, results):
+    window = open_window(qapp, results)
+    window.set_patient(KIM)
+    window.handle_event(BOTH)
+    window.note_edit.setPlainText("저장을 누르지 않은 메모")
+    window.set_patient(LEE)
+
+    window.handle_event(LEFT_ONLY)
+
+    assert note_of(results, "20261126_211205_12345") == "저장을 누르지 않은 메모"
+    assert note_of(results, "20261126_211205_67890") == ""
+    assert window.state_label.text() == "✔ 이두리 (67890) 환자 결과로 저장했습니다."
+
+
+def test_a_memo_too_long_for_the_sheet_is_pointed_out(qapp, results):
+    window = open_window(qapp, results)
+    window.handle_event(BOTH)
+
+    window.note_edit.setPlainText("짧은 메모")
+    assert window.note_hint.text() == ""
+    window.note_edit.setPlainText("\n".join(f"{line}번째 줄" for line in range(1, 8)))
+    assert "앞부분만 인쇄됩니다" in window.note_hint.text()
+
+
+def test_a_memo_added_after_sending_is_not_sent_again_by_itself(qapp, results):
+    sender = FakeSender()
+    window = open_window(qapp, results, settings=SENDING, send=sender)
+    window.set_patient(KIM)
+    window.handle_event(BOTH)
+    assert len(sender.sent) == 1
+
+    window.note_edit.setPlainText("보낸 뒤에 쓴 메모")
+    window.note_button.click()
+
+    assert len(sender.sent) == 1
+    assert window.capture_label.text().startswith("⚠ 보낸 뒤에 결과지를 고쳤습니다")
+    assert window.send_button.isEnabled()
+    history = json.loads((results / "20261126_211205_12345.json").read_text(encoding="utf-8"))["capture"]
+    assert history[-1]["code"] == "edited"
+
+    window.send_button.click()
+    assert len(sender.sent) == 2
+    assert window.capture_label.text().startswith("✔ 상쾌한캡처에 저장했습니다")
+
+
+def test_a_memo_written_before_sending_goes_out_with_the_sheet(qapp, results):
+    sender = FakeSender()
+    window = open_window(qapp, results, settings=Settings(cap_url="192.0.2.1", cap_key="key"), send=sender)
+    window.set_patient(KIM)
+    window.handle_event(BOTH)
+
+    window.note_edit.setPlainText("보내기 전에 쓴 메모")
+    window.note_button.click()
+    assert sender.sent == []
+
+    window.send_button.click()
+    assert len(sender.sent) == 1
+    assert window.capture_label.text().startswith("✔ 상쾌한캡처에 저장했습니다")
+
+
+def test_an_earlier_result_can_be_opened_and_its_memo_corrected(qapp, results):
+    first = open_window(qapp, results)
+    first.set_patient(KIM)
+    first.handle_event(BOTH)
+    first.note_edit.setPlainText("처음 메모")
+    first.note_button.click()
+
+    window = open_window(qapp, results)
+    window.open_result(results / "20261126_211205_12345.json")
+
+    assert window.patient() == KIM
+    assert window.note_edit.toPlainText() == "처음 메모"
+    assert window.state_label.text() == "✔ 김하나 (12345) 환자 결과로 저장했습니다."
+    assert not window.preview.pixmap().isNull()
+
+    window.note_edit.setPlainText("고친 메모")
+    window.note_button.click()
+
+    assert saved(results) == ["20261126_211205_12345.bin", "20261126_211205_12345.jpg", "20261126_211205_12345.json"]
+    assert note_of(results, "20261126_211205_12345") == "고친 메모"
+    assert json.loads((results / "20261126_211205_12345.json").read_text(encoding="utf-8"))["received_at"] \
+        == "2026-11-26T21:12:05"
+
+
+def test_an_earlier_result_opens_with_what_is_known_about_its_sending(qapp, results):
+    from functools import partial
+
+    from tsm300.records import send_sheet
+
+    def receiver(*_, **__):
+        return {"ok": True, "duplicate": False, "id": "1", "chartId": "66001",
+                "imageDataName": "66001_20261126_중이검사.jpg"}
+
+    first = open_window(qapp, results, settings=SENDING, send=partial(send_sheet, send=receiver))
+    first.set_patient(KIM)
+    first.handle_event(BOTH)
+
+    window = open_window(qapp, results, settings=SENDING, send=FakeSender())
+    window.open_result(results / "20261126_211205_12345.jpg")
+
+    assert window.capture_label.text().startswith("✔ 상쾌한캡처에 저장했습니다")
+    assert not window.send_button.isEnabled()
+
+
+def test_opening_a_result_does_not_carry_its_patient_onto_the_next_test(qapp, results):
+    first = open_window(qapp, results)
+    first.set_patient(KIM)
+    first.handle_event(BOTH)
+
+    window = open_window(qapp, results)
+    window.open_result(results / "20261126_211205_12345.json")
+    window.handle_event(LEFT_ONLY)
+
+    assert "앞 검사에 쓴 정보입니다" in window.state_label.text()
+    assert "20261126_211205.json" in saved(results)
+
+
+def test_a_result_that_cannot_be_read_is_reported(qapp, results, tmp_path):
+    window = open_window(qapp, results)
+    broken = tmp_path / "broken.json"
+    broken.write_text("{ not json", encoding="utf-8")
+
+    window.open_result(broken)
+    assert window.state_label.text().startswith("⚠ 결과 파일을 읽지 못했습니다")
+
+    window.open_result(tmp_path / "missing.json")
+    assert window.state_label.text() == "⚠ 결과 파일이 없습니다: missing.json"

@@ -209,3 +209,28 @@ class TestOnASerialPort:
         assert "포트 연결이 끊겼습니다: device removed" in text
         assert "종료합니다" in text
         assert len(list((tmp_path / "results").glob("*.jpg"))) == 1
+
+
+def test_a_saved_result_can_be_read_back(tmp_path):
+    from datetime import date
+
+    from tsm300.patient import Patient
+    from tsm300.store import load_result, save_result
+
+    patient = Patient("00512", "홍길동", "남", date(1975, 3, 4))
+    measurement = parse_message(BOTH)
+    history = ({"ok": True, "id": "1", "at": "2026-11-26T21:13:00"},)
+    sheet = save_result(measurement, tmp_path, WHEN, patient, "메모", history)
+
+    for path in (sheet, sheet.with_suffix(".json"), sheet.with_suffix(".bin")):
+        loaded = load_result(path)
+        assert (loaded.sheet, loaded.measurement, loaded.received_at) == (sheet, measurement, WHEN)
+        assert (loaded.patient, loaded.note, loaded.capture) == (patient, "메모", history)
+
+
+def test_decode_command_prints_a_memo_on_the_sheet(tmp_path):
+    code = cli.main(["decode", str(DATA / "left_only.bin"), "--out", str(tmp_path), "--note", "재검 필요"])
+
+    assert code == 0
+    (record,) = tmp_path.glob("*.json")
+    assert json.loads(record.read_text(encoding="utf-8"))["note"] == "재검 필요"

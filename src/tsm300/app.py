@@ -14,9 +14,9 @@ import serial
 from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QSizePolicy,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+    QSizePolicy, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import __version__, links
@@ -26,15 +26,16 @@ from .listen import RETRY_AFTER, open_file, read_events
 from .patient import Order, Patient, PatientSource, parse_birth_date
 from .protocol import Corrupt, Measurement, PowerOn
 from .records import Records, charts_tested_on, records_from_settings, send_sheet
-from .report import prepare
+from .report import prepare, wrap_note
 from .settings import Settings
 from .shortcut import ICON, claim_taskbar_identity
-from .store import delete_result, save_result
+from .store import delete_result, load_result, save_result
 
 NO_SOURCE_NOTE = "차트번호 조회와 오늘 검사 오더 목록은 [설정]에서 환자 조회를 연결하면 쓸 수 있습니다. 지금은 직접 입력해 주세요."
 WAITING = "검사 결과를 기다리는 중입니다. 검사 후 장비의 → 키를 누르세요."
 SAVE_LABEL = "이 환자 정보로 저장"
 REPLACE_LABEL = "직전 결과지의 환자 바꾸기..."
+EDITED_AFTER_SENDING = "edited"
 ORDER_COLUMNS = ("접수", "차트번호", "이름", "나이·성별", "진료실", "검사")
 ORDERS_REFRESH_MS = 30_000
 DONE_INK = QColor("#9a9a9a")
@@ -302,6 +303,7 @@ class MainWindow(QMainWindow):
         self._received_at: datetime | None = None
         self._sheet: Path | None = None
         self._sheet_patient = Patient()
+        self._sheet_note = ""
         self._patient_is_new = False
         self._orders: list[Order] = []
         self._loading_orders = False
@@ -332,6 +334,7 @@ class MainWindow(QMainWindow):
         self.orders_box = self._build_orders()
         side.addWidget(self.orders_box, stretch=1)
         side.addWidget(self._build_patient_form())
+        side.addWidget(self._build_note())
         self._side_filler = QWidget()
         self._side_filler.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         side.addWidget(self._side_filler)
@@ -368,12 +371,15 @@ class MainWindow(QMainWindow):
         self.send_button.clicked.connect(self.send_to_capture)
         self.open_button = QPushButton("결과지 열기")
         self.open_button.clicked.connect(self._open_sheet)
+        earlier_button = QPushButton("지난 결과 열기...")
+        earlier_button.clicked.connect(self._choose_result)
         folder_button = QPushButton("저장 폴더 열기")
         folder_button.clicked.connect(self._open_folder)
         buttons.addWidget(self.save_button)
         buttons.addWidget(self.send_button)
         buttons.addWidget(self.open_button)
         buttons.addStretch(1)
+        buttons.addWidget(earlier_button)
         buttons.addWidget(folder_button)
         main.addLayout(buttons)
         columns.addLayout(main, stretch=1)
@@ -438,6 +444,23 @@ class MainWindow(QMainWindow):
         self.sex_combo.activated.connect(self._patient_edited)
         return box
 
+    def _build_note(self) -> QGroupBox:
+        box = QGroupBox("메모 (화면의 결과지에 인쇄됩니다)")
+        layout = QVBoxLayout(box)
+        self.note_edit = QPlainTextEdit()
+        self.note_edit.setFixedHeight(96)
+        self.note_edit.setPlaceholderText("결과를 받은 뒤에 쓸 수 있습니다")
+        self.note_edit.textChanged.connect(self._show_state)
+        layout.addWidget(self.note_edit)
+        self.note_hint = QLabel()
+        self.note_hint.setWordWrap(True)
+        self.note_hint.setStyleSheet("color: #b3261e;")
+        layout.addWidget(self.note_hint)
+        self.note_button = QPushButton("메모 저장")
+        self.note_button.clicked.connect(self.save_note)
+        layout.addWidget(self.note_button)
+        return box
+
     # ----- settings -----------------------------------------------------------------------
 
     def open_settings(self) -> None:
@@ -477,10 +500,7 @@ class MainWindow(QMainWindow):
         )
 
     def set_patient(self, patient: Patient) -> None:
-        self.chart_edit.setText(patient.chart_no)
-        self.name_edit.setText(patient.name)
-        self.sex_combo.setCurrentText(patient.sex)
-        self.birth_edit.setText(patient.birth_date.isoformat() if patient.birth_date else "")
+        self._fill_form(patient)
         self._patient_edited()
 
     def clear_patient(self) -> None:
@@ -617,8 +637,42 @@ class MainWindow(QMainWindow):
                              "그쪽 것은 상쾌한캡처 사진 이력에서 '중이검사' 카드를 오른쪽 클릭해 [삭제…]로 지워 주세요.")
             if not self._confirm(question):
                 return
-        delete_result(self._sheet)
-        self._save(patient)
+        self._patient_is_new = False
+        self._save_again(patient, self._note_text(), send=self._settings.cap_on)
+
+    def save_note(self) -> None:
+        """Prints the memo on the shown sheet. A sheet already sent is not sent again by itself,
+        because 상쾌한캡처 would keep both copies."""
+        if self._measurement is None or self._sheet is None or self._sending:
+            return
+        note = self._note_text()
+        if note == self._sheet_note:
+            return
+        was_sent = bool(self._sent and self._sent.get("ok"))
+        self._save_again(self._sheet_patient, note, send=self._settings.cap_on and not was_sent)
+
+    def open_result(self, path: Path) -> None:
+        """Shows a result saved earlier, so that its memo or patient can be corrected."""
+        try:
+            saved = load_result(path)
+        except ValueError as error:
+            self.state_label.setText(f"⚠ {error}")
+            return
+        self._keep_unsaved_note()
+        self._measurement, self._received_at = saved.measurement, saved.received_at
+        self._sheet, self._sheet_patient, self._sheet_note = saved.sheet, saved.patient, saved.note
+        self._sent = dict(saved.capture[-1]) if saved.capture else None
+        self._fill_form(saved.patient)
+        self._patient_is_new = False
+        self.note_edit.setPlainText(saved.note)
+        self.preview.show_sheet(self._sheet)
+        self._show_capture()
+        self._show_state()
+
+    def _choose_result(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileName(self, "지난 결과 열기", str(self._directory), "결과 (*.json)")
+        if chosen:
+            self.open_result(Path(chosen))
 
     def send_to_capture(self) -> None:
         """Sends the shown sheet to 상쾌한캡처, which checks the chart number and name against the records."""
@@ -653,25 +707,59 @@ class MainWindow(QMainWindow):
         if self._measurement is not None and measurement.raw == self._measurement.raw:
             self.state_label.setText("같은 결과를 다시 받았습니다. 이미 저장되어 있습니다.")
             return
-        self._measurement = measurement
-        self._received_at = self._now()
         try:
             patient = self.patient() if self._patient_is_new else Patient()
         except ValueError:
             patient = Patient()
-        self._save(patient)
-
-    def _save(self, patient: Patient) -> None:
-        self._sheet = save_result(self._measurement, self._directory, self._received_at, patient)
-        self._sheet_patient = patient
-        self._patient_is_new = False
+        self._keep_unsaved_note()
+        self._measurement = measurement
+        self._received_at = self._now()
         self._sent = None
-        self.preview.show_sheet(self._sheet)
+        self._patient_is_new = False
+        self.note_edit.setPlainText("")
+        self._saved(save_result(measurement, self._directory, self._received_at, patient), patient, "")
+        if self._settings.cap_on:
+            self.send_to_capture()
+
+    def _save_again(self, patient: Patient, note: str, send: bool) -> None:
+        """Rewrites the shown result with these details, keeping the record of what was sent."""
+        try:
+            history = load_result(self._sheet).capture
+        except ValueError:
+            history = ()
+        if self._sent and self._sent.get("ok"):
+            edited = {"ok": False, "code": EDITED_AFTER_SENDING, "error": "보낸 뒤 결과지를 고침", "retry": True,
+                      "at": self._now().isoformat(timespec="seconds")}
+            history += (edited,)
+            self._sent = edited
+        elif patient != self._sheet_patient:
+            self._sent = None
+        directory = self._sheet.parent
+        delete_result(self._sheet)
+        self._saved(save_result(self._measurement, directory, self._received_at, patient, note, history), patient, note)
+        if send:
+            self.send_to_capture()
+
+    def _saved(self, sheet: Path, patient: Patient, note: str) -> None:
+        self._sheet, self._sheet_patient, self._sheet_note = sheet, patient, note
+        self.preview.show_sheet(sheet)
         self._show_capture()
         self._show_state()
         self._show_orders()
-        if self._settings.cap_on:
-            self.send_to_capture()
+
+    def _keep_unsaved_note(self) -> None:
+        """Saves a memo typed for the shown result before another result takes its place."""
+        if self._measurement is not None and self._sheet is not None and self._note_text() != self._sheet_note:
+            self._save_again(self._sheet_patient, self._note_text(), send=False)
+
+    def _note_text(self) -> str:
+        return self.note_edit.toPlainText().strip()
+
+    def _fill_form(self, patient: Patient) -> None:
+        self.chart_edit.setText(patient.chart_no)
+        self.name_edit.setText(patient.name)
+        self.sex_combo.setCurrentText(patient.sex)
+        self.birth_edit.setText(patient.birth_date.isoformat() if patient.birth_date else "")
 
     # ----- display ------------------------------------------------------------------------
 
@@ -687,6 +775,9 @@ class MainWindow(QMainWindow):
         saved_for = self._sheet_patient
         next_up = not patient.is_empty and self._patient_is_new
         self.open_button.setEnabled(has_result)
+        self.note_edit.setEnabled(has_result)
+        self.note_button.setEnabled(has_result and not self._sending and self._note_text() != self._sheet_note)
+        self.note_hint.setText("메모가 길어 결과지에는 앞부분만 인쇄됩니다." if wrap_note(self._note_text())[1] else "")
         self.send_button.setVisible(self._settings.capture_ready)
         self.send_button.setEnabled(self._can_send())
         self.save_button.setText(SAVE_LABEL)
@@ -730,6 +821,9 @@ class MainWindow(QMainWindow):
         elif sent.get("ok"):
             again = " (이미 들어가 있던 결과지)" if sent.get("duplicate") else ""
             text = f"✔ 상쾌한캡처에 저장했습니다{again}: {sent.get('imageDataName') or ''}"
+        elif sent.get("code") == EDITED_AFTER_SENDING:
+            text = ("⚠ 보낸 뒤에 결과지를 고쳤습니다. 상쾌한캡처에는 고치기 전 것이 들어 있습니다. [상쾌한캡처로 보내기]를 누르면 "
+                    "고친 결과지가 새 장으로 들어가니, 먼저 것은 상쾌한캡처 사진 이력에서 [삭제…]로 지워 주세요.")
         else:
             later = " 잠시 뒤 [상쾌한캡처로 보내기]를 눌러 다시 보낼 수 있습니다." if sent.get("retry") else ""
             text = f"⚠ 상쾌한캡처에 보내지 못했습니다: {sent.get('error')} ({sent.get('code')}).{later}"

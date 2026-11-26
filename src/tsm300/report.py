@@ -14,6 +14,7 @@ from matplotlib import font_manager
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
+from matplotlib.textpath import TextToPath
 
 from . import __version__
 from .patient import Patient
@@ -48,6 +49,14 @@ NORMAL_COMPLIANCE = (0.2, 1.5)
 # 90% ranges of Margolis & Heller (1987), rounded as in the ASHA (1990) screening guidelines.
 # The device gives no range for these two. The children were three to five years old.
 ADULT_FROM_AGE = 18
+
+PROBE_TONE_HZ = 226
+
+# The memo box: where it sits, the size of its text, and how many lines of it fit.
+NOTE_TOP, NOTE_HEIGHT, NOTE_PADDING = 244.0, 30.0, 3.5
+NOTE_FONT_SIZE = 9.5
+NOTE_LINES = 5
+POINTS_PER_MM = 72 / 25.4
 EAR_VOLUME_RANGE = {"adult": (0.6, 1.5), "child": (0.4, 1.0)}
 WIDTH_RANGE = {"adult": (50, 110), "child": (60, 150)}
 
@@ -76,7 +85,9 @@ _KOREAN = {
                        "외이도 용적과 폭은 Margolis & Heller (1987) 기준입니다. 소아는 3~5세 자료입니다."),
     "adult": "성인",
     "child": "소아",
-    "reflex": "등골근 반사 (동측, ml)",
+    "reflex": "등골근 반사 · 컴플라이언스 변화 (ml)",
+    "probe": "프로브 {hz} Hz",
+    "note": "메모",
     "normal_range": "정상 범위",
     "not_measured": "측정 없음",
     "no_reflex": "반사 검사 없음",
@@ -105,7 +116,9 @@ _ENGLISH = {
                        "ear volume and width follow Margolis & Heller (1987), children aged 3 to 5."),
     "adult": "Adult",
     "child": "Child",
-    "reflex": "Acoustic reflex (ipsilateral, ml)",
+    "reflex": "Acoustic reflex · compliance change (ml)",
+    "probe": "Probe {hz} Hz",
+    "note": "Notes",
     "normal_range": "Normal range",
     "not_measured": "Not measured",
     "no_reflex": "No reflex test",
@@ -129,8 +142,48 @@ def prepare() -> None:
     _font_and_labels()
 
 
+def wrap_note(text: str) -> tuple[list[str], bool]:
+    """Breaks a memo into the lines that fit the sheet's memo box.
+
+    Returns the lines and whether some of the memo did not fit. Lines break at spaces where
+    they can; Hangul has few, so a line also breaks inside a word when it must. Widths are
+    measured in the sheet's own font, since a row of W is nearly twice as wide as a row of i.
+    """
+    room = (PAGE_WIDTH - 2 * MARGIN - 2 * NOTE_PADDING) * POINTS_PER_MM
+    wrapped: list[str] = []
+    for paragraph in text.strip().splitlines():
+        line, width, last_space = "", 0.0, -1
+        for character in paragraph.rstrip():
+            size = _character_width(character)
+            if width + size > room:
+                if character != " " and last_space > 0:
+                    wrapped.append(line[:last_space])
+                    line = line[last_space + 1:]
+                else:
+                    wrapped.append(line)
+                    line = ""
+                width = sum(_character_width(kept) for kept in line)
+                last_space = -1
+                if character == " ":
+                    continue
+            if character == " ":
+                last_space = len(line)
+            line += character
+            width += size
+        wrapped.append(line)
+    return wrapped[:NOTE_LINES], len(wrapped) > NOTE_LINES
+
+
+@lru_cache(maxsize=None)
+def _character_width(character: str) -> float:
+    """The advance of one character in the memo's font, in points."""
+    fonts, _ = _font_and_labels()
+    properties = font_manager.FontProperties(family=fonts, size=NOTE_FONT_SIZE)
+    return TextToPath().get_text_width_height_descent(character, properties, False)[0]
+
+
 def render(measurement: Measurement, path: Path, received_at: datetime,
-           patient: Patient = Patient(), clinic: str = CLINIC_NAME) -> None:
+           patient: Patient = Patient(), note: str = "", clinic: str = CLINIC_NAME) -> None:
     """Writes the result sheet to ``path``; the file type follows its suffix (.jpg or .png)."""
     fonts, labels = _font_and_labels()
     with matplotlib.rc_context({"font.family": fonts, "axes.unicode_minus": False}):
@@ -138,8 +191,9 @@ def render(measurement: Measurement, path: Path, received_at: datetime,
         _draw_header(figure, labels, clinic if labels is _KOREAN else "", received_at)
         _draw_patient(figure, labels, patient, received_at)
         _draw_tympanograms(figure, labels, measurement)
-        _draw_values(figure, labels, measurement, patient.age_on(received_at.date()))
         _draw_reflexes(figure, labels, measurement)
+        _draw_values(figure, labels, measurement, patient.age_on(received_at.date()))
+        _draw_note(figure, labels, note)
         _draw_footer(figure, labels, measurement)
         options = {"quality": 95, "subsampling": 0} if Path(path).suffix.lower() in (".jpg", ".jpeg") else {}
         figure.savefig(path, dpi=DPI, pil_kwargs=options)
@@ -177,10 +231,12 @@ def _draw_tympanograms(figure: Figure, labels: dict, measurement: Measurement) -
         _line(figure, x, x + 6, 60.7, color=color, width=2.4)
         _text(figure, x + 8.5, 62, name, size=12, weight="bold")
         if ear is None:
-            _text(figure, x + COLUMN_WIDTH / 2, 106, labels["not_measured"], size=11, color=INK_SECONDARY, ha="center")
+            _text(figure, x + COLUMN_WIDTH / 2, 100, labels["not_measured"], size=11, color=INK_SECONDARY, ha="center")
             continue
         _text(figure, x + AXES_INSET, 68.5, labels["compliance_axis"], size=8.5, color=INK_SECONDARY)
-        axes = _axes(figure, x + AXES_INSET, 71, COLUMN_WIDTH - AXES_INSET - 1, 72)
+        _text(figure, x + COLUMN_WIDTH - 1, 68.5, labels["probe"].format(hz=PROBE_TONE_HZ), size=8.5,
+              color=INK_SECONDARY, ha="right")
+        axes = _axes(figure, x + AXES_INSET, 71, COLUMN_WIDTH - AXES_INSET - 1, 58)
         _plot_tympanogram(axes, ear, color, labels)
 
 
@@ -211,13 +267,13 @@ def _plot_tympanogram(axes, ear: EarResult, color: str, labels: dict) -> None:
 
 def _draw_values(figure: Figure, labels: dict, measurement: Measurement, age: int | None) -> None:
     right_x, left_x, reference_x = 96.0, 127.0, 169.0
-    _text(figure, MARGIN, 165, labels["values"], size=11, weight="bold")
-    _text(figure, MARGIN, 173, labels["item"], size=9, color=INK_SECONDARY)
+    _text(figure, MARGIN, 181, labels["values"], size=11, weight="bold")
+    _text(figure, MARGIN, 189, labels["item"], size=9, color=INK_SECONDARY)
     for x, name, color in ((right_x, labels["right"], RIGHT_EAR), (left_x, labels["left"], LEFT_EAR)):
-        _text(figure, x, 173, name, size=9, color=INK_SECONDARY, ha="center")
-        _line(figure, x - 9, x + 9, 175.6, color=color, width=1.6)
-    _text(figure, reference_x, 173, labels["reference"], size=9, color=INK_SECONDARY, ha="center")
-    _rule(figure, 177)
+        _text(figure, x, 189, name, size=9, color=INK_SECONDARY, ha="center")
+        _line(figure, x - 9, x + 9, 191.6, color=color, width=1.6)
+    _text(figure, reference_x, 189, labels["reference"], size=9, color=INK_SECONDARY, ha="center")
+    _rule(figure, 193)
     low_pressure, high_pressure = NORMAL_PRESSURE
     low_compliance, high_compliance = NORMAL_COMPLIANCE
     rows = [
@@ -227,13 +283,13 @@ def _draw_values(figure: Figure, labels: dict, measurement: Measurement, age: in
         (labels["width"], lambda ear: f"{ear.width:d}", _by_age(WIDTH_RANGE, age, labels)),
     ]
     for index, (label, value_of, reference) in enumerate(rows):
-        y = 183 + index * 8.5
+        y = 199 + index * 8
         _text(figure, MARGIN, y, label, size=10)
         for x, ear in ((right_x, measurement.right), (left_x, measurement.left)):
             _text(figure, x, y, value_of(ear) if ear else "-", size=12, weight="bold", ha="center")
         _text(figure, reference_x, y, reference, size=9, color=INK_SECONDARY, ha="center")
-        _rule(figure, y + 3.5, color=ROW_RULE)
-    _text(figure, MARGIN, 216.5, labels["reference_note"], size=7, color=INK_SECONDARY)
+        _rule(figure, y + 3.3, color=ROW_RULE)
+    _text(figure, MARGIN, 231.5, labels["reference_note"], size=7, color=INK_SECONDARY)
 
 
 def _by_age(ranges: dict, age: int | None, labels: dict) -> str:
@@ -243,24 +299,26 @@ def _by_age(ranges: dict, age: int | None, labels: dict) -> str:
 
 
 def _draw_reflexes(figure: Figure, labels: dict, measurement: Measurement) -> None:
-    _text(figure, MARGIN, 227, labels["reflex"], size=11, weight="bold")
+    """A strip of five traces under each tympanogram. A reflex lowers compliance, so the scale runs
+    from 0 at the bottom to -0.2 ml at the top, as on the device's own screen."""
     span = COLUMN_WIDTH - AXES_INSET - 1
     gap = 2.5
     panel = (span - gap * (len(REFLEX_FREQUENCIES) - 1)) / len(REFLEX_FREQUENCIES)
     points = range(REFLEX_POINTS)
-    for x, ear, name, color in _columns(labels, measurement):
-        _line(figure, x, x + 5, 233.9, color=color, width=2.0)
-        _text(figure, x + 7, 235, name, size=9, color=INK_SECONDARY)
-        if ear is None or not ear.reflexes:
-            message = labels["not_measured"] if ear is None else labels["no_reflex"]
-            _text(figure, x + COLUMN_WIDTH / 2, 253, message, size=10, color=INK_SECONDARY, ha="center")
+    for x, ear, _, color in _columns(labels, measurement):
+        if ear is None:
+            continue
+        _text(figure, x + AXES_INSET, 148.5, labels["reflex"], size=8.5, color=INK_SECONDARY)
+        if not ear.reflexes:
+            _text(figure, x + COLUMN_WIDTH / 2, 161, labels["no_reflex"], size=10, color=INK_SECONDARY, ha="center")
             continue
         for index, frequency in enumerate(REFLEX_FREQUENCIES):
-            axes = _axes(figure, x + AXES_INSET + index * (panel + gap), 240, panel, 26)
+            axes = _axes(figure, x + AXES_INSET + index * (panel + gap), 151, panel, 17)
             axes.set_xlim(0, REFLEX_POINTS - 1)
             axes.set_ylim(0, 0.2)
             axes.set_xticks([])
             axes.set_yticks([0, 0.1, 0.2])
+            axes.set_yticklabels(["0", "-0.1", "-0.2"])
             _style_axes(axes)
             if index > 0:
                 axes.tick_params(labelleft=False)
@@ -270,6 +328,18 @@ def _draw_reflexes(figure: Figure, labels: dict, measurement: Measurement) -> No
                 axes.fill_between(points, curve, 0, color=color, alpha=0.10, linewidth=0, zorder=2)
                 axes.plot(points, curve, color=color, linewidth=1.3, solid_capstyle="round",
                           solid_joinstyle="round", zorder=3, clip_on=False)
+
+
+def _draw_note(figure: Figure, labels: dict, note: str) -> None:
+    """The memo box. It is drawn even when empty, so there is room to write on a printed sheet."""
+    _text(figure, MARGIN, NOTE_TOP - 3, labels["note"], size=11, weight="bold")
+    figure.add_artist(Rectangle(
+        (MARGIN / PAGE_WIDTH, 1 - (NOTE_TOP + NOTE_HEIGHT) / PAGE_HEIGHT), (PAGE_WIDTH - 2 * MARGIN) / PAGE_WIDTH,
+        NOTE_HEIGHT / PAGE_HEIGHT, transform=figure.transFigure, facecolor="none", edgecolor=AXIS, linewidth=0.6,
+    ))
+    lines, _ = wrap_note(note)
+    for index, line in enumerate(lines):
+        _text(figure, MARGIN + NOTE_PADDING, NOTE_TOP + 6.3 + index * 5.2, line, size=NOTE_FONT_SIZE)
 
 
 def _draw_footer(figure: Figure, labels: dict, measurement: Measurement) -> None:

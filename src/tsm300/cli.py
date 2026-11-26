@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     decode.add_argument("--name", default="", help="환자 이름")
     decode.add_argument("--sex", default="", help="성별 (남 또는 여)")
     decode.add_argument("--birth", default="", help="생년월일 (예: 1980-01-31)")
+    decode.add_argument("--note", default="", help="결과지에 인쇄할 메모")
     return parser
 
 
@@ -82,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
             patient = Patient(args.chart, args.name, parse_sex(args.sex), parse_birth_date(args.birth))
         except ValueError as error:
             parser.error(str(error))
-        return listen.decode_files(args.files, Path(args.out), console, patient)
+        return listen.decode_files(args.files, Path(args.out), console, patient, args.note)
     from . import app
     return app.run(args)
 

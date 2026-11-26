@@ -57,13 +57,14 @@ class Listener:
     """Feeds received bytes to the decoder and acts on what comes out."""
 
     def __init__(self, console: Console, directory: Path, show: bool = False,
-                 now: Callable[[], datetime] = datetime.now, patient: Patient = Patient()) -> None:
+                 now: Callable[[], datetime] = datetime.now, patient: Patient = Patient(), note: str = "") -> None:
         self.saved: list[Path] = []
         self._console = console
         self._directory = directory
         self._show = show
         self._now = now
         self._patient = patient
+        self._note = note
 
     def run(self, ser, stop: Callable[[], bool] = lambda: False,
             clock: Callable[[], float] = time.monotonic) -> None:
@@ -89,7 +90,7 @@ class Listener:
         self._console.say(describe_ear("왼쪽", measurement.left))
         if measurement.unknown:
             self._console.say(f"  알 수 없는 항목: {', '.join(sorted(measurement.unknown))}")
-        sheet = save_result(measurement, self._directory, received_at, self._patient)
+        sheet = save_result(measurement, self._directory, received_at, self._patient, self._note)
         self.saved.append(sheet)
         self._console.say(f"  저장: {sheet.resolve()}")
         if self._show:
@@ -136,9 +137,9 @@ def run(args, console: Console, port_opener=open_port, sleep: Callable[[float], 
 
 
 def decode_files(paths: list[str], directory: Path, console: Console, patient: Patient = Patient(),
-                 now: Callable[[], datetime] = datetime.now) -> int:
+                 note: str = "", now: Callable[[], datetime] = datetime.now) -> int:
     """Decodes saved raw transmissions, as if the device had just sent them."""
-    listener = Listener(console, directory, now=now, patient=patient)
+    listener = Listener(console, directory, now=now, patient=patient, note=note)
     for path in paths:
         console.say(f"\n{path}")
         decoder = StreamDecoder()
