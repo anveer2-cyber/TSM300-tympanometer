@@ -65,6 +65,11 @@ def _font_and_labels() -> tuple[list[str], dict[str, str]]:
     return ["DejaVu Sans"], _ENGLISH
 
 
+def prepare() -> None:
+    """Does the slow one-off font lookup now, so the first result is not held up by it."""
+    _font_and_labels()
+
+
 def render(measurement: Measurement, path: Path, received_at: datetime) -> None:
     fonts, labels = _font_and_labels()
     with matplotlib.rc_context({"font.family": fonts, "axes.unicode_minus": False}):

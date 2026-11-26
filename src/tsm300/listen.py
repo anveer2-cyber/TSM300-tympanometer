@@ -15,7 +15,7 @@ import serial
 from . import __version__
 from .console import Console, choose_port, open_port
 from .protocol import Corrupt, EarResult, Measurement, PowerOn, StreamDecoder, tympanogram_pressures
-from .render import render
+from .render import prepare, render
 
 STALE_AFTER = 3.0
 RETRY_AFTER = 5.0
@@ -124,6 +124,7 @@ def run(args, console: Console, port_opener=open_port, sleep: Callable[[float], 
         return 1
     listener = Listener(console, Path(args.out), show=args.show)
     try:
+        prepare()
         while True:
             try:
                 ser = port_opener(port, args.baud)
