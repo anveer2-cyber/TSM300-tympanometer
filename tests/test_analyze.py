@@ -5,7 +5,7 @@ import pytest
 from tsm300.analyze import (
     guess_baud, hexdump, is_line_noise, is_oversampled, looks_like_text, printable_ratio,
 )
-from tsm300.cli import SCAN_BAUDS
+from tsm300.wizard import SCAN_BAUDS
 from uart_sim import receive
 
 

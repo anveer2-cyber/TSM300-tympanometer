@@ -5,15 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tsm300"
 dynamic = ["version"]
-description = "Oscilla TSM-300 tympanometer serial capture tools"
+description = "Receive and decode Oscilla TSM-300 tympanometer results over its serial port"
 requires-python = ">=3.9"
-dependencies = ["pyserial>=3.5"]
+dependencies = ["pyserial>=3.5", "matplotlib>=3.6"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
 
 [project.scripts]
-tsm300-capture = "tsm300.cli:main"
+tsm300 = "tsm300.cli:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "tsm300.__version__" }

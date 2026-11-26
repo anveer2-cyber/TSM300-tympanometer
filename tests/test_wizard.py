@@ -1,4 +1,4 @@
-"""Runs the whole wizard against a pseudo-terminal that plays the part of the device."""
+"""Runs the capture wizard against a pseudo-terminal that plays the part of the device."""
 
 import io
 import json
@@ -10,7 +10,8 @@ from datetime import datetime
 
 import pytest
 
-from tsm300 import cli
+from tsm300 import cli, wizard
+from tsm300.console import Console
 
 pty = pytest.importorskip("pty")
 
@@ -45,13 +46,13 @@ class Answers:
 
 def run_wizard(tmp_path, argv, answers):
     out = io.StringIO()
-    args = cli.build_parser().parse_args(argv + ["--out", str(tmp_path), "--idle-gap", "0.3"])
-    code = cli.run(args, cli.Console(answers, out), now=lambda: datetime(2026, 11, 26, 20, 30, 15))
+    args = cli.build_parser().parse_args(["capture"] + argv + ["--out", str(tmp_path), "--idle-gap", "0.3"])
+    code = wizard.run(args, Console(answers, out), now=lambda: datetime(2026, 11, 26, 20, 30, 15))
     return code, out.getvalue(), tmp_path / "20261126_203015"
 
 
 def test_scan_finds_the_baud_then_capture_records_a_noted_burst(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "SCAN_SETTLE", 0.3)
+    monkeypatch.setattr(wizard, "SCAN_SETTLE", 0.3)
     device = Device()
     device.send_after(0.3, ID_KEY)
     answers = Answers(
