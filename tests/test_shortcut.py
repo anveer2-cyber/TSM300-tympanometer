@@ -53,15 +53,50 @@ def test_shortcut_starts_the_program_without_a_console_from_the_chosen_folder(tm
     created = create_shortcut(work, folder)
 
     assert created == folder / f"{SHORTCUT_NAME}.lnk" and created.exists()
-    read_back = (
-        "$link = (New-Object -ComObject WScript.Shell).CreateShortcut($env:TSM300_LINK); "
+    link = read_back(created)
+    assert Path(link["target"]) == windowless_python()
+    assert link["arguments"] == "-m tsm300"
+    assert Path(link["working_directory"]) == work
+    assert Path(link["icon"]) == ICON
+    assert link["description"] == SHORTCUT_NAME
+
+
+@pytest.mark.skipif(not ON_WINDOWS, reason="needs the Windows shell")
+def test_shortcut_goes_to_the_desktop_by_default(tmp_path, monkeypatch, capsys):
+    import tsm300.shortcut as shortcut
+
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir()
+    monkeypatch.setattr(shortcut, "_desktop", lambda ole32: desktop)
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["shortcut"]) == 0
+
+    assert (desktop / f"{SHORTCUT_NAME}.lnk").exists()
+    said = capsys.readouterr().out
+    assert "바로가기를 만들었습니다" in said and str(tmp_path / "results") in said
+
+
+@pytest.mark.skipif(not ON_WINDOWS, reason="needs the Windows shell")
+def test_the_real_desktop_folder_is_found():
+    import ctypes
+
+    import tsm300.shortcut as shortcut
+
+    assert shortcut._desktop(ctypes.OleDLL("ole32")).is_dir()
+
+
+def read_back(link: Path) -> dict:
+    """Reads a shortcut with the Windows shell itself, independently of the code that wrote it."""
+    script = (
+        "$item = (New-Object -ComObject Shell.Application).NameSpace($env:TSM300_FOLDER).ParseName($env:TSM300_FILE); "
+        "$link = $item.GetLink; $icon = ''; [void]$link.GetIconLocation([ref]$icon); "
         "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
-        "Write-Output $link.TargetPath $link.Arguments $link.WorkingDirectory $link.IconLocation"
+        "Write-Output $link.Path $link.Arguments $link.WorkingDirectory $icon $link.Description"
     )
-    finished = subprocess.run(["powershell", "-NoProfile", "-Command", read_back],
-                              env=dict(os.environ, TSM300_LINK=str(created)), capture_output=True, check=True)
-    target, arguments, working_directory, icon = finished.stdout.decode("utf-8").split("\r\n")[:4]
-    assert Path(target) == windowless_python()
-    assert arguments == "-m tsm300"
-    assert Path(working_directory) == work
-    assert Path(icon.split(",")[0]) == ICON
+    finished = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", script], capture_output=True, check=True,
+        env=dict(os.environ, TSM300_FOLDER=str(link.parent), TSM300_FILE=link.name),
+    )
+    lines = finished.stdout.decode("utf-8").split("\r\n")
+    return dict(zip(("target", "arguments", "working_directory", "icon", "description"), lines))
