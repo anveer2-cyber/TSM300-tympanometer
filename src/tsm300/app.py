@@ -15,11 +15,12 @@ from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
-    QSizePolicy, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
+    QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import __version__, links
+from . import update as update_module
 from . import settings as settings_file
 from .console import available_ports, open_port
 from .listen import RETRY_AFTER, open_file, read_events
@@ -280,6 +281,109 @@ class SettingsDialog(QDialog):
         self.lookup_test_button.setEnabled(bool(via))
 
 
+class UpdateDialog(QDialog):
+    """Looks for a newer version, installs it when asked, and offers to start it.
+
+    It ends accepted when the operator wants the program started again with the new version.
+    """
+
+    def __init__(self, parent: QWidget | None, updates=update_module, background: Background = run_in_background) -> None:
+        super().__init__(parent)
+        self._updates = updates
+        self._background = background
+        self._release = None
+        self._progress = (0, 0)
+        self._busy = False
+        self.setWindowTitle("업데이트")
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        self.message = QLabel()
+        self.message.setWordWrap(True)
+        self.message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.message)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.install_button = QPushButton("지금 설치")
+        self.install_button.clicked.connect(self.install)
+        self.restart_button = QPushButton("다시 켜기")
+        self.restart_button.clicked.connect(self.accept)
+        self.close_button = QPushButton("닫기")
+        self.close_button.clicked.connect(self.reject)
+        for button in (self.install_button, self.restart_button, self.close_button):
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        self.install_button.setVisible(False)
+        self.restart_button.setVisible(False)
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(150)
+        self._progress_timer.timeout.connect(self._show_progress)
+        self.look()
+
+    def look(self) -> None:
+        self.message.setText("새 버전이 있는지 확인하는 중입니다...")
+
+        def done(release, error) -> None:
+            if error is not None:
+                self.message.setText(f"⚠ {error}")
+            elif not self._updates.is_newer(release.version):
+                self.message.setText(f"지금 쓰는 v{__version__} 이 최신 버전입니다.")
+            elif self._updates.program_file() is None:
+                self.message.setText(f"새 버전 v{release.version} 이 있습니다. (지금 v{__version__})\n\n"
+                                     "Python 으로 설치한 프로그램은 명령 프롬프트에서 아래 명령으로 업데이트합니다.\n\n"
+                                     f"{self._updates.PYTHON_COMMAND}")
+            else:
+                self._release = release
+                self.message.setText(f"새 버전 v{release.version} 이 있습니다. (지금 v{__version__})\n\n"
+                                     "[지금 설치]를 누르면 새 버전을 받아 바꿔 넣습니다. 받는 동안에도 검사 결과는 그대로 받습니다.")
+                self.install_button.setVisible(True)
+
+        self._background(self, self._updates.latest_release, done)
+
+    def install(self) -> None:
+        release = self._release
+        self._busy = True
+        self._progress = (0, 0)
+        self.install_button.setEnabled(False)
+        self.close_button.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.message.setText(f"v{release.version} 을 받는 중입니다...")
+        self._progress_timer.start()
+
+        def note_progress(received: int, total: int) -> None:  # called on the downloading thread
+            self._progress = (received, total)
+
+        def done(_, error) -> None:
+            self._busy = False
+            self._progress_timer.stop()
+            self.progress_bar.setVisible(False)
+            self.close_button.setEnabled(True)
+            if error is not None:
+                self.message.setText(f"⚠ {error}")
+                self.install_button.setEnabled(True)
+                return
+            self.install_button.setVisible(False)
+            self.restart_button.setVisible(True)
+            self.close_button.setText("나중에")
+            self.message.setText(f"✔ v{release.version} 을 받았습니다.\n\n[다시 켜기]를 누르면 프로그램이 새 버전으로 다시 켜집니다. "
+                                 "다시 켜지는 동안에는 장비에서 결과를 보내지 마세요.\n"
+                                 "[나중에]를 누르면 다음에 프로그램을 켤 때부터 새 버전입니다.")
+
+        self._background(self, lambda: self._updates.install(release, self._updates.program_file(), note_progress), done)
+
+    def reject(self) -> None:
+        if not self._busy:  # the program file must not be left half replaced
+            super().reject()
+
+    def _show_progress(self) -> None:
+        received, total = self._progress
+        self.progress_bar.setRange(0, 100 if total else 0)
+        if total:
+            self.progress_bar.setValue(received * 100 // total)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, directory: Path, settings: Settings | None = None, source: PatientSource | None = None,
                  now: Callable[[], datetime] = datetime.now,
@@ -287,9 +391,10 @@ class MainWindow(QMainWindow):
                  confirm_patient: Callable[[Patient], bool] | None = None,
                  background: Background = run_in_background,
                  send: Callable[..., dict] = send_sheet,
-                 settings_directory: Path | None = None) -> None:
+                 settings_directory: Path | None = None, updates=update_module) -> None:
         super().__init__()
         self._directory = directory
+        self._updates = updates
         self._settings = settings or Settings()
         self._settings_directory = settings_directory
         self._source = source if source is not None else records_from_settings(self._settings)
@@ -349,6 +454,9 @@ class MainWindow(QMainWindow):
         self.connection_label = QLabel(self._connection)
         self.connection_label.setStyleSheet("color: #666666;")
         top.addWidget(self.connection_label, stretch=1)
+        update_button = QPushButton("업데이트")
+        update_button.clicked.connect(self.open_update)
+        top.addWidget(update_button)
         settings_button = QPushButton("설정")
         settings_button.clicked.connect(self.open_settings)
         top.addWidget(settings_button)
@@ -477,6 +585,20 @@ class MainWindow(QMainWindow):
         self._source = records_from_settings(settings)
         self._show_source()
         self._show_state()
+
+    def open_update(self) -> None:
+        if UpdateDialog(self, self._updates, self._background).exec() == QDialog.DialogCode.Accepted:
+            self.restart_updated()
+
+    def restart_updated(self) -> None:
+        """Starts the newly installed program and closes this one, losing nothing typed."""
+        self._keep_unsaved_note()
+        try:
+            self._updates.restart(self._updates.program_file(), sys.argv[1:])
+        except OSError as error:
+            QMessageBox.warning(self, "업데이트", f"새 버전을 켜지 못했습니다. 프로그램을 닫고 직접 다시 켜 주세요.\n\n{error}")
+            return
+        self.close()
 
     def _show_source(self) -> None:
         has_source = self._source is not None
@@ -889,6 +1011,9 @@ def _run_window(app: QApplication, args) -> int:
     else:
         window.show_connection("시리얼 포트를 찾지 못했습니다. 케이블을 연결하고 프로그램을 다시 켜 주세요.")
     window.show()
+    program = update_module.program_file()
+    if program is not None:  # just after an update the replaced file is still in use by the program that started this one
+        QTimer.singleShot(20_000, lambda: update_module.clean_up(program))
     code = app.exec()
     if worker is not None:
         worker.requestInterruption()

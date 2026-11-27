@@ -3,6 +3,7 @@
 import gc
 import json
 import os
+import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -18,8 +19,11 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from conftest import needs_pty, pty  # noqa: E402
 from fakes import KEY, TOKEN, CaptureReceiver, RelayServer  # noqa: E402
+from tsm300 import __version__, update  # noqa: E402
 from tsm300 import settings as settings_file  # noqa: E402
-from tsm300.app import REPLACE_LABEL, SAVE_LABEL, MainWindow, SettingsDialog, run_in_background  # noqa: E402
+from tsm300.app import (  # noqa: E402
+    REPLACE_LABEL, SAVE_LABEL, MainWindow, SettingsDialog, UpdateDialog, run_in_background,
+)
 from tsm300.patient import Order, Patient  # noqa: E402
 from tsm300.protocol import Corrupt, parse_message  # noqa: E402
 from tsm300.settings import Settings  # noqa: E402
@@ -74,6 +78,40 @@ class FakeSender:
         self.sent.append((sheet.name, patient, tested_on))
         self.internal_numbers.append(internal_number)
         return dict(self.outcome)
+
+
+class FakeUpdates:
+    """Stands in for the releases page and for replacing the program file."""
+
+    PYTHON_COMMAND = "python -m pip install --upgrade (주소)"
+
+    def __init__(self, version="99.0.0", program=Path("TSM300.exe"), unreachable=False, download_fails=False):
+        self.version = version
+        self.program = program
+        self.unreachable = unreachable
+        self.download_fails = download_fails
+        self.installed = []
+        self.restarted = []
+
+    def latest_release(self):
+        if self.unreachable:
+            raise update.UpdateError("새 버전이 있는지 확인하지 못했습니다.")
+        return update.Release(self.version, "http://unused")
+
+    def is_newer(self, version):
+        return update.is_newer(version)
+
+    def program_file(self):
+        return self.program
+
+    def install(self, release, program, progress=None):
+        progress(5, 10)
+        if self.download_fails:
+            raise update.UpdateError("내려받기가 중간에 끊겼습니다.")
+        self.installed.append((release.version, program))
+
+    def restart(self, program, arguments):
+        self.restarted.append((program, arguments))
 
 
 def run_now(owner, work, done):
@@ -864,3 +902,76 @@ def test_a_result_that_cannot_be_read_is_reported(qapp, results, tmp_path):
 
     window.open_result(tmp_path / "missing.json")
     assert window.state_label.text() == "⚠ 결과 파일이 없습니다: missing.json"
+
+
+# ----- updating ----------------------------------------------------------------------------
+
+def open_update_dialog(updates):
+    dialog = UpdateDialog(None, updates, run_now)
+    _OPENED.append(dialog)
+    return dialog
+
+
+def test_update_dialog_says_when_nothing_newer_is_out(qapp):
+    dialog = open_update_dialog(FakeUpdates(version=__version__))
+
+    assert dialog.message.text() == f"지금 쓰는 v{__version__} 이 최신 버전입니다."
+    assert dialog.install_button.isHidden() and dialog.restart_button.isHidden()
+
+
+def test_update_dialog_installs_a_newer_version_and_offers_to_start_it(qapp):
+    updates = FakeUpdates()
+    dialog = open_update_dialog(updates)
+    assert dialog.message.text().startswith(f"새 버전 v99.0.0 이 있습니다. (지금 v{__version__})")
+    assert not dialog.install_button.isHidden() and dialog.restart_button.isHidden()
+
+    dialog.install_button.click()
+
+    assert updates.installed == [("99.0.0", Path("TSM300.exe"))]
+    assert dialog.message.text().startswith("✔ v99.0.0 을 받았습니다.")
+    assert dialog.install_button.isHidden() and not dialog.restart_button.isHidden()
+    assert dialog.close_button.text() == "나중에"
+
+    dialog.restart_button.click()
+
+    assert dialog.result() == UpdateDialog.DialogCode.Accepted
+
+
+def test_update_dialog_says_what_went_wrong_and_lets_the_download_be_tried_again(qapp):
+    unreachable = open_update_dialog(FakeUpdates(unreachable=True))
+    assert unreachable.message.text() == "⚠ 새 버전이 있는지 확인하지 못했습니다."
+    assert unreachable.install_button.isHidden()
+
+    updates = FakeUpdates(download_fails=True)
+    dialog = open_update_dialog(updates)
+    dialog.install_button.click()
+
+    assert dialog.message.text() == "⚠ 내려받기가 중간에 끊겼습니다."
+    assert dialog.install_button.isEnabled() and dialog.close_button.isEnabled() and dialog.restart_button.isHidden()
+
+    updates.download_fails = False
+    dialog.install_button.click()
+
+    assert updates.installed == [("99.0.0", Path("TSM300.exe"))]
+
+
+def test_update_dialog_gives_a_python_install_the_command_instead(qapp):
+    dialog = open_update_dialog(FakeUpdates(program=None))
+
+    assert "새 버전 v99.0.0 이 있습니다." in dialog.message.text()
+    assert FakeUpdates.PYTHON_COMMAND in dialog.message.text()
+    assert dialog.install_button.isHidden()
+
+
+def test_starting_the_new_version_keeps_a_memo_being_typed_and_closes_this_one(qapp, results):
+    updates = FakeUpdates()
+    window = open_window(qapp, results, updates=updates)
+    window.set_patient(KIM)
+    window.handle_event(BOTH)
+    window.note_edit.setPlainText("저장을 누르지 않은 메모")
+
+    window.restart_updated()
+
+    assert updates.restarted == [(Path("TSM300.exe"), sys.argv[1:])]
+    assert note_of(results, "20261126_211205_12345") == "저장을 누르지 않은 메모"
+    assert not window.isVisible()

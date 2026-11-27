@@ -1,4 +1,4 @@
-"""Command line: the operator's window (the default), a desktop shortcut, console listening, raw capture, ports, decoding."""
+"""Command line: the operator's window (the default), updating, a desktop shortcut, console listening, raw capture, ports, decoding."""
 
 from __future__ import annotations
 
@@ -31,6 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("ports", help="시리얼 포트 목록을 보여 줍니다")
     commands.add_parser("shortcut", help="바탕 화면에 프로그램 바로가기를 만듭니다")
 
+    update = commands.add_parser("update", help="새 버전이 있으면 받아서 바꿔 넣습니다 (exe 로 쓸 때)")
+    update.add_argument("--check", action="store_true", help="새 버전이 있는지만 알려 줍니다")
+    update.add_argument("--again", action="store_true", help="새 버전이 아니어도 올라와 있는 버전을 다시 받습니다")
+    update.add_argument("--restart", action="store_true", help="바꿔 넣은 뒤 프로그램을 켭니다")
+
     capture = commands.add_parser("capture", help="장비가 보내는 원시 데이터를 그대로 기록합니다 (분석용)")
     _add_port_options(capture)
     capture.add_argument("--scan", action="store_true", help="통신 속도를 모를 때 자동으로 찾습니다")
@@ -54,6 +59,9 @@ def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")
+    if settings_file.is_packaged():
+        from . import update
+        update.clean_up(Path(sys.executable))
     parser = build_parser()
     args = parser.parse_args(argv)
     console = Console()
@@ -74,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
         console.say(f"바로가기를 만들었습니다: {created}")
         console.say(f"바로가기로 실행하면 결과는 {settings_file.results_directory().resolve()} 에 저장됩니다.")
         return 0
+    if args.command == "update":
+        return _update(args, console)
     if args.command == "capture":
         from . import wizard
         return wizard.run(args, console)
@@ -91,6 +101,34 @@ def main(argv: list[str] | None = None) -> int:
     if args.out is None:
         args.out = str(settings_file.results_directory())
     return app.run(args)
+
+
+def _update(args, console: Console) -> int:
+    from . import update
+    try:
+        release = update.latest_release()
+        console.say(f"지금 버전: {__version__}")
+        console.say(f"올라와 있는 버전: {release.version}")
+        if args.check:
+            return 0
+        if not (args.again or update.is_newer(release.version)):
+            console.say("이미 최신 버전입니다.")
+            return 0
+        program = update.program_file()
+        if program is None:
+            console.say("Python 으로 설치한 프로그램은 아래 명령으로 업데이트합니다.")
+            console.say(update.PYTHON_COMMAND)
+            return 1
+        update.install(release, program)
+    except update.UpdateError as error:
+        console.say(str(error))
+        return 1
+    console.say(f"v{release.version} 으로 바꿨습니다.")
+    if args.restart:
+        update.restart(program, [])
+    else:
+        console.say("프로그램을 다시 켜면 새 버전입니다.")
+    return 0
 
 
 def _give_missing_streams_somewhere_to_go() -> None:

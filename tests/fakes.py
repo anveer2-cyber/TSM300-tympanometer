@@ -1,4 +1,5 @@
-"""Stand-ins for the clinic's systems: a records database in sqlite and a 상쾌한캡처 receiver."""
+"""Stand-ins for what the program talks to: a records database in sqlite, a 상쾌한캡처 receiver,
+the relay server and the releases page."""
 
 from __future__ import annotations
 
@@ -183,6 +184,55 @@ class RelayServer:
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"127.0.0.1:{self._server.server_address[1]}"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+class ReleaseSite:
+    """Answers like the project's releases page: ``latest`` leads to the newest release, which holds the program file."""
+
+    PROGRAM = b"MZ" + bytes(range(256)) * 2048  # about half a megabyte, so it arrives in several pieces
+
+    def __init__(self, version: str = "99.0.0", published: bool = True, cut_short: bool = False) -> None:
+        self.requests: list[tuple[str, str]] = []
+        site = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_HEAD(self):
+                self._answer(with_body=False)
+
+            def do_GET(self):
+                self._answer(with_body=True)
+
+            def _answer(self, with_body):
+                site.requests.append((self.command, self.path))
+                release = f"/releases/tag/v{version}"
+                if self.path == "/releases/latest":
+                    self.send_response(302)
+                    self.send_header("Location", release if published else "/releases")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                elif self.path in (release, "/releases"):
+                    self.send_response(200)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                elif self.path == f"/releases/download/v{version}/TSM300.exe":
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(site.PROGRAM)))
+                    self.end_headers()
+                    if with_body:
+                        self.wfile.write(site.PROGRAM[:len(site.PROGRAM) // 2] if cut_short else site.PROGRAM)
+                else:
+                    self.send_error(404)
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}/releases"
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
 
     def close(self) -> None:

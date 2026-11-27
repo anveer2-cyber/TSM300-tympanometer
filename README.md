@@ -14,7 +14,7 @@ Oscilla TSM-300 임피던스 청력검사기(tympanometer)의 검사 결과를 �
 - 파일 하나에 모든 것이 들어 있어서 켜지는 데 시간이 조금 걸립니다.
 - 결과는 `%APPDATA%\TSM300\results` 에 저장됩니다. 창의 [저장 폴더 열기]로 엽니다. 다른 폴더를 쓰려면 바로가기의 대상 뒤에 `--out D:\검사결과` 처럼 적습니다.
 - 설정도 `%APPDATA%\TSM300` 에 있습니다. exe 를 새 것으로 바꾸거나 다른 폴더로 옮겨도 설정과 결과는 그대로입니다.
-- 업데이트는 새 `TSM300.exe` 를 내려받아 바꿔 넣으면 됩니다.
+- 업데이트는 창 오른쪽 위 [업데이트]를 누릅니다. 새 버전이 있으면 [지금 설치]로 받아 바꿔 넣고, [다시 켜기]를 누르면 새 버전으로 켜집니다. 받는 동안에도 검사 결과는 그대로 받습니다. 인터넷이 되어야 합니다.
 - exe 는 64비트입니다. 매직차트 DB 에 직접 연결하려면 이 PC 에 64비트 ODBC 데이터 원본이 있어야 합니다. 예진이 서버를 거치면 상관없습니다.
 
 아래 설명의 `python -m tsm300` 자리에 `TSM300.exe` 를 쓰면 됩니다. exe 는 명령 프롬프트 창 없이 뜨므로, 글로 답하는 명령은 `TSM300.exe ports > ports.txt` 처럼 파일로 받아 봅니다.
@@ -126,6 +126,7 @@ TSM300 에서 환자를 바꿔 다시 저장하면 새 결과지가 새 환자�
 | `python -m tsm300 listen` | 창 없이 명령 프롬프트에서 결과를 받아 저장 (환자 정보 없음) |
 | `python -m tsm300 decode 파일.bin --chart 00512 --name 홍길동` | 저장해 둔 원본 데이터로 결과지를 다시 만들기 |
 | `python -m tsm300 shortcut` | 바탕 화면 바로가기 만들기 |
+| `TSM300.exe update` | 새 버전이 있으면 받아서 바꿔 넣기 (창의 [업데이트]와 같은 일). `--check` 는 확인만 |
 | `python -m tsm300 ports` | 시리얼 포트 목록 |
 | `python -m tsm300 capture` | 장비가 보내는 바이트를 해독 없이 그대로 기록 (형식 분석용) |
 
@@ -151,6 +152,6 @@ python -m pip install . pyinstaller
 python tools/build_exe.py
 ```
 
-`dist\TSM300.exe` 가 생깁니다. `tools\check_exe.ps1` 은 만든 exe 의 버전, 결과지 그리기, 창 뜨기를 확인합니다. GitHub 에 올리면 같은 일이 자동으로 돌고, 버전 번호(`src/tsm300/__init__.py`)가 새것이면 그 exe 가 Releases 에 올라갑니다.
+`dist\TSM300.exe` 가 생깁니다. `tools\check_exe.ps1` 은 만든 exe 의 버전, 결과지 그리기, 창 뜨기, 스스로 업데이트하기를 확인합니다. GitHub 에 올리면 같은 일이 자동으로 돌고, 버전 번호(`src/tsm300/__init__.py`)가 새것이면 그 exe 가 Releases 에 올라갑니다.
 
 `tests/data` 의 파일은 실제 장비에서 받은 전송입니다. 병원 DB 와 상쾌한캡처는 테스트에서 가짜(`tests/fakes.py`)로 대신합니다. `src/tsm300/links.py` 는 병원의 VNGLive 프로그램에서 쓰는 조회와 전송 코드를 옮겨 온 것입니다. 화면 테스트는 `QT_QPA_PLATFORM=offscreen` 환경변수를 주면 화면 없이 돌아갑니다.
