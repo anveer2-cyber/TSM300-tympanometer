@@ -2470,3 +2470,79 @@ def test_a_warning_that_a_patient_could_not_be_saved_does_not_go_with_a_memo_tak
     window.note_edit.setPlainText("")
 
     assert window.problem_label.text().startswith("⚠ 고친 내용을 저장하지 못했습니다")
+
+
+# ----- remarks: kept with the result, never printed ---------------------------------------------------------
+
+def test_remarks_are_saved_with_a_tympanogram_filed_and_reopened_but_never_printed(qapp, results):
+    window = open_window(qapp, results)
+    window.set_patient(KIM)
+    window.handle_event(BOTH)
+    stem = "20261126_211205_12345"
+    sheet_before = (results / f"{stem}.jpg").read_bytes()
+    assert window.remarks_edit.isEnabled() and not window.note_button.isEnabled()
+
+    window.remarks_edit.setPlainText("  아이가 울어서 두 번 검사함  ")
+    assert window.note_button.isEnabled()
+    window.note_button.click()
+
+    record = record_of(results, stem)
+    assert (record["remarks"], record["note"], record["exam"]) == ("아이가 울어서 두 번 검사함", "", "tymp")
+    assert (results / f"{stem}.jpg").read_bytes() == sheet_before
+    assert not window.note_button.isEnabled()
+
+    window.file_button.click()
+    copy = results / "보관" / "2026-11" / "2026-11-26" / "12345_김하나_2112.json"
+    assert json.loads(copy.read_text(encoding="utf-8"))["remarks"] == "아이가 울어서 두 번 검사함"
+
+    other = open_window(qapp, results)
+    other.open_result(copy)
+    assert other.remarks_edit.toPlainText() == "아이가 울어서 두 번 검사함"
+    other.remarks_edit.setPlainText("고친 특이사항")
+    other.note_button.click()
+    assert record_of(results, stem)["remarks"] == "고친 특이사항"
+    assert json.loads(copy.read_text(encoding="utf-8"))["remarks"] == "고친 특이사항"
+
+
+def test_remarks_left_unsaved_stay_with_their_result_when_the_next_one_arrives_or_the_window_closes(qapp, results):
+    window = open_window(qapp, results)
+    window.set_patient(KIM)
+    window.handle_event(BOTH)
+    window.remarks_edit.setPlainText("저장을 누르지 않은 특이사항")
+    window.set_patient(LEE)
+
+    window.handle_event(LEFT_ONLY)
+
+    assert record_of(results, "20261126_211205_12345")["remarks"] == "저장을 누르지 않은 특이사항"
+    assert record_of(results, "20261126_211205_67890")["remarks"] == ""
+    assert window.remarks_edit.toPlainText() == ""
+
+    window.remarks_edit.setPlainText("닫기 전에 쓰던 특이사항")
+    window.close()
+    assert record_of(results, "20261126_211205_67890")["remarks"] == "닫기 전에 쓰던 특이사항"
+
+
+def test_remarks_that_could_not_be_saved_are_kept_and_put_back_when_their_sheet_is_reopened(qapp, results, monkeypatch):
+    import tsm300.app as app
+
+    window = open_window(qapp, results)
+    window.set_patient(KIM)
+    window.handle_event(BOTH)
+    window.remarks_edit.setPlainText("놓치면 안 되는 특이사항")
+    window.clear_patient()
+    really_save = app.save_result
+
+    def held_open(*arguments, replacing=None, **options):
+        if replacing is not None:
+            raise PermissionError(13, "다른 프로세스가 파일을 사용 중입니다")
+        return really_save(*arguments, **options)
+
+    monkeypatch.setattr(app, "save_result", held_open)
+    window.handle_event(LEFT_ONLY)
+    assert "특이사항: 놓치면 안 되는 특이사항" in window.problem_label.text()
+
+    monkeypatch.setattr(app, "save_result", really_save)
+    window.open_result(results / "20261126_211205_12345.json")
+    assert window.remarks_edit.toPlainText() == "놓치면 안 되는 특이사항" and window.note_button.isEnabled()
+    window.note_button.click()
+    assert record_of(results, "20261126_211205_12345")["remarks"] == "놓치면 안 되는 특이사항"

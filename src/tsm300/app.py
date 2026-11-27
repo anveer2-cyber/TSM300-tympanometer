@@ -29,6 +29,7 @@ from .archive import archive_directory, file_result, filed_sheet, refresh_copy
 from .clinic import Clinic
 from .console import available_ports, open_port
 from .hearing import device as hearing_device
+from .hearing.editor import Edited, HearingEditor
 from .hearing.record import HearingResult, MergeError, Part, can_be_aided, describe, device_birth_date, type_of
 from .hearing.session import fingerprint
 from .listen import RETRY_AFTER, open_file, read_events
@@ -60,6 +61,9 @@ HEARING_LABEL = "청력검사기에서 받기"
 WAITING_WITH_HEARING = ("검사 결과를 기다리는 중입니다. 임피던스는 검사 후 장비의 → 키를, "
                         "청력검사는 검사를 마친 뒤 [청력검사기에서 받기]를 누르세요.")
 HEARING_PROGRESS_MS = 200
+VALUES_LABEL = "검사 값 고치기..."
+MANUAL_LABEL = "직접 입력..."
+REMARKS_LABEL = "특이사항 (결과지에 안 나옴)"
 
 Background = Callable[[QObject, Callable[[], object], Callable[[object, "Exception | None"], None]], None]
 
@@ -859,7 +863,8 @@ class MainWindow(QMainWindow):
                  directory_follows_settings: bool = False,
                  hearing_opener: Callable[[str], Callable[[], object]] = hearing_device.opener_for,
                  choose_hearing: Callable[..., tuple | None] | None = None,
-                 fetch_hearing: Callable[..., object] = hearing_device.fetch) -> None:
+                 fetch_hearing: Callable[..., object] = hearing_device.fetch,
+                 run_editor: Callable[[QDialog], object] | None = None) -> None:
         super().__init__()
         self._directory = _full(directory)
         self._directory_follows_settings = directory_follows_settings
@@ -878,11 +883,13 @@ class MainWindow(QMainWindow):
         self._sheet: Path | None = None
         self._sheet_patient = Patient()
         self._sheet_note = ""
+        self._sheet_remarks = ""
         self._sheet_tested_at: datetime | None = None
         self._sheet_clinic = self._settings.clinic
         self._problem = ""
         self._problem_is_about_edits = False
-        self._lost: tuple[Path, str, datetime] | None = None
+        self._lost: tuple[Path, str, datetime, str] | None = None
+        self._last_save_error = ""
         self._filed = ""
         self._filing_problem = ""
         self._redraw_after_sending = False
@@ -897,6 +904,7 @@ class MainWindow(QMainWindow):
         self._hearing_opener = hearing_opener
         self._choose_hearing = choose_hearing or self._ask_hearing
         self._fetch_hearing = fetch_hearing
+        self._run_editor = run_editor or (lambda dialog: dialog.exec())
         self._receiving = False
         self._hearing_progress = 0
         self._hearing_text = ""
@@ -950,6 +958,10 @@ class MainWindow(QMainWindow):
         self.hearing_button.setToolTip("청력검사기(MRS Resonance)에 저장된 순음 · 어음 · 음장 검사를 읽어 와 결과지로 만듭니다.")
         self.hearing_button.clicked.connect(self.receive_hearing)
         top.addWidget(self.hearing_button)
+        self.manual_button = QPushButton(MANUAL_LABEL)
+        self.manual_button.setToolTip("청력검사기 없이 순음 · 어음 · 음장 값을 손으로 넣어 결과지를 만듭니다.")
+        self.manual_button.clicked.connect(self.enter_hearing_by_hand)
+        top.addWidget(self.manual_button)
         update_button = QPushButton("업데이트")
         update_button.clicked.connect(self.open_update)
         top.addWidget(update_button)
@@ -1108,9 +1120,21 @@ class MainWindow(QMainWindow):
         self.note_hint.setWordWrap(True)
         self.note_hint.setStyleSheet("color: #b3261e;")
         layout.addWidget(self.note_hint)
+        layout.addWidget(QLabel(REMARKS_LABEL))
+        self.remarks_edit = QPlainTextEdit()
+        self.remarks_edit.setFixedHeight(56)
+        self.remarks_edit.setPlaceholderText("인쇄하지 않고 저장만 합니다. 직원끼리 알아 둘 것을 적습니다")
+        self.remarks_edit.textChanged.connect(self._show_state)
+        layout.addWidget(self.remarks_edit)
+        buttons = QHBoxLayout()
         self.note_button = QPushButton(EDIT_LABEL)
         self.note_button.clicked.connect(self.save_edits)
-        layout.addWidget(self.note_button)
+        buttons.addWidget(self.note_button, stretch=1)
+        self.values_button = QPushButton(VALUES_LABEL)
+        self.values_button.setToolTip("청력검사 결과지의 역치 · 차폐 · 어음 값을 고칩니다. 고친 값은 결과지에 그대로 인쇄됩니다.")
+        self.values_button.clicked.connect(self.edit_hearing_values)
+        buttons.addWidget(self.values_button)
+        layout.addLayout(buttons)
         return box
 
     # ----- settings -----------------------------------------------------------------------
@@ -1457,6 +1481,7 @@ class MainWindow(QMainWindow):
             return
         self._measurement, self._received_at = saved.measurement, saved.received_at
         self._sheet, self._sheet_patient, self._sheet_note = saved.sheet, saved.patient, saved.note
+        self._sheet_remarks = saved.remarks
         self._sheet_tested_at = _minute(saved.tested_at)
         # A sheet keeps the clinic it was printed with. One printed with none (or saved before
         # that was written down) gets the clinic in the settings when it is next rewritten.
@@ -1467,11 +1492,11 @@ class MainWindow(QMainWindow):
         self._problem, self._problem_is_about_edits = "", False
         self._fill_form(saved.patient)
         self._patient_is_new = False
-        self._show_edits(saved.note, self._sheet_tested_at)
+        self._show_edits(saved.note, self._sheet_tested_at, saved.remarks)
         if self._lost is not None and self._lost[0] == saved.sheet:
-            _, note, tested_at = self._lost
+            _, note, tested_at, remarks = self._lost
             self._lost = None
-            self._show_edits(note, tested_at)
+            self._show_edits(note, tested_at, remarks)
             self._problem = "저장하지 못했던 검사일시와 메모를 다시 채웠습니다. [검사일시 · 메모 저장]을 눌러 주세요."
             self._problem_is_about_edits = True
         self.preview.show_sheet(self._sheet)
@@ -1489,7 +1514,8 @@ class MainWindow(QMainWindow):
             if origin.with_suffix(".json").exists() and origin.with_suffix(".bin").exists():
                 return load_result(_full(origin))
         sheet = save_result(copy.measurement, self._directory, copy.received_at, copy.patient, copy.note, copy.capture,
-                            tested_at=copy.tested_at, clinic=copy.clinic or Clinic(), filed=copy.filed)
+                            tested_at=copy.tested_at, clinic=copy.clinic or Clinic(), filed=copy.filed,
+                            remarks=copy.remarks)
         where = file_result(sheet, self._archive(), copy.patient, copy.tested_at, str(copy.sheet.with_suffix("")))
         note_in_record(sheet, filed=where)
         return load_result(sheet)
@@ -1572,23 +1598,31 @@ class MainWindow(QMainWindow):
             patient = Patient()
         self._result_arrived(measurement, patient, self._now())
 
-    def _result_arrived(self, measurement: Measurement | HearingResult, patient: Patient, received_at: datetime) -> bool:
-        """Saves a result that has just come from a device and shows it. False when it could not be saved."""
-        lost = None if self._keep_unsaved_edits() else (self._sheet, self._note_text(), self._tested_value())
-        tested_at = _minute(received_at)
+    def _result_arrived(self, measurement: Measurement | HearingResult, patient: Patient, received_at: datetime,
+                        tested_at: datetime | None = None, note: str = "", remarks: str = "",
+                        by_hand: bool = False) -> bool:
+        """Saves a result that has just come from a device, or been typed in by hand, and shows it.
+        False when it could not be saved; ``by_hand`` leaves saying why to the caller (``_last_save_error``)."""
+        lost = (None if self._keep_unsaved_edits()
+                else (self._sheet, self._note_text(), self._tested_value(), self._remarks_text()))
+        tested_at = _minute(tested_at or received_at)
         try:
-            sheet = save_result(measurement, self._directory, received_at, patient,
-                                tested_at=tested_at, clinic=self._settings.clinic)
+            sheet = save_result(measurement, self._directory, received_at, patient, note,
+                                tested_at=tested_at, clinic=self._settings.clinic, remarks=remarks)
         except Exception as error:  # a full disk, a folder that has gone, a sheet that cannot be drawn
-            self._could_not_save(measurement, received_at, error)
+            if by_hand:
+                self._log_unexpected(error)
+                self._last_save_error = f"결과지를 저장하지 못했습니다: {error}"
+            else:
+                self._could_not_save(measurement, received_at, error)
             return False
         self._measurement, self._received_at = measurement, received_at
         self._sheet_clinic = self._settings.clinic
         self._sent = None
         self._filed, self._filing_problem = "", ""
         self._patient_is_new = False
-        self._show_edits("", tested_at)
-        self._saved(sheet, patient, "", tested_at)
+        self._show_edits(note, tested_at, remarks)
+        self._saved(sheet, patient, note, tested_at, remarks)
         if lost is not None:
             self._lost = lost
             self._show_state()
@@ -1602,9 +1636,10 @@ class MainWindow(QMainWindow):
         back in their boxes when that result is opened again."""
         if self._lost is None:
             return ""
-        sheet, note, tested_at = self._lost
+        sheet, note, tested_at, remarks = self._lost
         return (f"⚠ 앞 결과지({sheet.name})에 고치던 내용을 저장하지 못했습니다. [지난 결과 열기...]로 그 결과를 열면 "
-                f"아래 내용이 다시 채워집니다.\n검사일시: {tested_at:%Y-%m-%d %H:%M} · 메모: {note or '(없음)'}")
+                f"아래 내용이 다시 채워집니다.\n검사일시: {tested_at:%Y-%m-%d %H:%M} · 메모: {note or '(없음)'}"
+                + (f" · 특이사항: {remarks}" if remarks else ""))
 
     def _could_not_save(self, measurement: Measurement | HearingResult, received_at: datetime, error: Exception) -> None:
         """Keeps what the device sent and says what to do. The result shown before stays as it was,
@@ -1628,14 +1663,19 @@ class MainWindow(QMainWindow):
         self._show_state()
 
     def _save_again(self, patient: Patient, note: str, send: bool, tested_at: datetime | None = None,
-                    only_edits: bool = False) -> bool:
+                    only_edits: bool = False, remarks: str | None = None,
+                    measurement: Measurement | HearingResult | None = None) -> bool:
         """Rewrites the shown result with these details, keeping the record of what was sent.
 
-        Returns False, with the files as they were, when they cannot be rewritten.
-        ``only_edits`` says the save is of the test time and memo alone: a warning about
-        such a save goes away when the operator takes those back.
+        Returns False, with the files as they were, when they cannot be rewritten; what went
+        wrong is then in ``_last_save_error``. ``only_edits`` says the save is of the test time,
+        memo and remarks alone: a warning about such a save goes away when the operator takes
+        those back. ``remarks`` are those in their box unless given; ``measurement`` is the
+        shown result with its values corrected, which takes its place once it is saved.
         """
         tested_at = tested_at or self._sheet_tested_at
+        remarks = self._remarks_text() if remarks is None else remarks
+        measurement = measurement or self._measurement
         clinic = self._sheet_clinic
         try:
             history = load_result(self._sheet).capture
@@ -1649,12 +1689,12 @@ class MainWindow(QMainWindow):
         elif patient != self._sheet_patient and not self._in_capture():
             sent = None
         try:
-            sheet = save_result(self._measurement, self._sheet.parent, self._received_at, patient, note, history,
-                                tested_at=tested_at, clinic=clinic, replacing=self._sheet, filed=self._filed)
+            sheet = save_result(measurement, self._sheet.parent, self._received_at, patient, note, history,
+                                tested_at=tested_at, clinic=clinic, replacing=self._sheet, filed=self._filed,
+                                remarks=remarks)
         except Exception as error:  # most often the sheet is open in another program, which holds the file
-            if not isinstance(error, OSError):
-                folder = self._settings_directory or settings_file.settings_directory()
-                write_error_log(folder, "".join(traceback.format_exception(type(error), error, error.__traceback__)))
+            self._log_unexpected(error)
+            self._last_save_error = f"고친 내용을 저장하지 못했습니다: {error}"
             self._problem = (f"⚠ 고친 내용을 저장하지 못했습니다: {error}\n"
                              "결과지를 다른 프로그램에서 열어 두었다면 닫고 다시 저장해 주세요.")
             # A warning about a memo or test time goes when those are taken back. One about a
@@ -1663,14 +1703,22 @@ class MainWindow(QMainWindow):
             self._show_state()
             return False
         self._sent = sent
-        self._saved(sheet, patient, note, tested_at)
+        self._measurement = measurement
+        self._saved(sheet, patient, note, tested_at, remarks)
         self._refile()
         if send:
             self._send_when_possible()
         return True
 
-    def _saved(self, sheet: Path, patient: Patient, note: str, tested_at: datetime) -> None:
+    def _log_unexpected(self, error: Exception) -> None:
+        """Writes down an error that is not of the expected kinds (a file held open, a full disk)."""
+        if not isinstance(error, OSError):
+            folder = self._settings_directory or settings_file.settings_directory()
+            write_error_log(folder, "".join(traceback.format_exception(type(error), error, error.__traceback__)))
+
+    def _saved(self, sheet: Path, patient: Patient, note: str, tested_at: datetime, remarks: str = "") -> None:
         self._sheet, self._sheet_patient, self._sheet_note, self._sheet_tested_at = sheet, patient, note, tested_at
+        self._sheet_remarks = remarks
         self._problem, self._problem_is_about_edits = "", False
         self.preview.show_sheet(sheet)
         self._show_capture()
@@ -1692,7 +1740,7 @@ class MainWindow(QMainWindow):
         """Saves what was being corrected, and asks before anything would be lost with the window:
         corrections that cannot be saved, and sheets that have not finished going to 상쾌한캡처."""
         if not self._keep_unsaved_edits() and not self._confirm(
-                "고치던 검사일시와 메모를 저장하지 못했습니다.\n결과지를 다른 프로그램에서 열어 두었다면 닫고 다시 해 주세요.\n\n"
+                "고치던 검사일시 · 메모 · 특이사항을 저장하지 못했습니다.\n결과지를 다른 프로그램에서 열어 두었다면 닫고 다시 해 주세요.\n\n"
                 "저장하지 않고 프로그램을 닫을까요?"):
             return False
         if self._receiving and not self._confirm(
@@ -1713,15 +1761,17 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _edited(self) -> bool:
-        return self._note_text() != self._sheet_note or self._tested_value() != self._sheet_tested_at
+        return (self._note_text() != self._sheet_note or self._tested_value() != self._sheet_tested_at
+                or self._remarks_text() != self._sheet_remarks)
 
-    def _show_edits(self, note: str, tested_at: datetime) -> None:
-        """Puts a result's memo and test time in the boxes where they are corrected."""
+    def _show_edits(self, note: str, tested_at: datetime, remarks: str = "") -> None:
+        """Puts a result's memo, remarks and test time in the boxes where they are corrected."""
         self.tested_edit.setDateTimeRange(
             QDateTime(min(tested_at, EARLIEST_TEST)),
             QDateTime(max(self._now(), tested_at).replace(hour=23, minute=59, second=0)))
         self.tested_edit.setDateTime(QDateTime(tested_at))
         self.note_edit.setPlainText(note)
+        self.remarks_edit.setPlainText(remarks)
 
     def _tested_value(self) -> datetime | None:
         """The test time in its box, or None while no result is shown."""
@@ -1731,6 +1781,9 @@ class MainWindow(QMainWindow):
 
     def _note_text(self) -> str:
         return self.note_edit.toPlainText().strip()
+
+    def _remarks_text(self) -> str:
+        return self.remarks_edit.toPlainText().strip()
 
     def _fill_form(self, patient: Patient) -> None:
         self.chart_edit.setText(patient.chart_no)
@@ -1760,7 +1813,11 @@ class MainWindow(QMainWindow):
         self.output_button.setEnabled(has_result and not self._sending)
         self.output_button.setText(OUTPUT_LABEL if self._settings.capture_ready else OUTPUT_LABEL_WITHOUT_SENDING)
         self.note_edit.setEnabled(has_result and not self._sending)
+        self.remarks_edit.setEnabled(has_result and not self._sending)
         self.tested_edit.setEnabled(has_result and not self._sending)
+        hearing = isinstance(self._measurement, HearingResult)
+        self.values_button.setVisible(self._settings.hearing_on or hearing)
+        self.values_button.setEnabled(hearing and self._sheet is not None and not self._sending)
         self.note_button.setEnabled(has_result and not self._sending and self._edited())
         self.clinic_hint.setVisible(not self._settings.clinic.name)
         self.note_hint.setText("메모가 길어 결과지에는 앞부분만 인쇄됩니다." if wrap_note(self._note_text())[1] else "")
@@ -1915,6 +1972,87 @@ class MainWindow(QMainWindow):
         self._hearing_text += logged
         self._show_hearing()
 
+    def edit_hearing_values(self) -> None:
+        """Opens the shown hearing result's values for correcting. They go on the sheet as if they
+        had come that way; the device's own values stay in the raw data and beside the corrections."""
+        if not isinstance(self._measurement, HearingResult) or self._sheet is None or self._sending:
+            return
+        sheet = self._sheet
+
+        def save(edited: Edited) -> str:
+            if self._sheet != sheet:  # another result took the screen while the values were being corrected
+                return self._save_values_elsewhere(sheet, edited)
+            # The boxes show what is being saved first: sending saves what they hold before it goes.
+            typed = (self._note_text(), self._tested_value(), self._remarks_text())
+            self._show_edits(edited.note, edited.tested_at, edited.remarks)
+            # A sheet that already went to 상쾌한캡처 is not sent again by itself, as with a memo.
+            if not self._save_again(self._sheet_patient, edited.note, send=self._settings.cap_on and not self._in_capture(),
+                                    tested_at=edited.tested_at, only_edits=True, remarks=edited.remarks,
+                                    measurement=edited.result):
+                self._show_edits(*typed)
+                self._show_state()
+                return self._last_save_error
+            return ""
+
+        self._open_editor(HearingEditor(
+            self, self._measurement, patient=self._sheet_patient, tested_at=self._tested_value(),
+            note=self._note_text(), remarks=self._remarks_text(), save=save, confirm=self._confirm, now=self._now))
+
+    def enter_hearing_by_hand(self) -> None:
+        """Opens an empty sheet of hearing values to type a result in without the audiometer. It is
+        saved like a result received from it, for the patient in the window under the same rules."""
+        if not self._settings.hearing_on:
+            return
+        try:
+            patient = self.patient()
+        except ValueError:
+            patient = Patient()
+
+        def save(edited: Edited) -> str:
+            received_at = self._now()
+            if not self._result_arrived(edited.result, patient if edited.with_patient else Patient(), received_at,
+                                        tested_at=edited.tested_at, note=edited.note, remarks=edited.remarks,
+                                        by_hand=True):
+                return self._last_save_error
+            self._hearing_text = "✔ 직접 입력한 값으로 청력검사 결과지를 만들었습니다."
+            self._show_hearing()
+            return ""
+
+        self._open_editor(HearingEditor(self, None, patient=patient, patient_is_new=self._patient_is_new,
+                                        tested_at=_minute(self._now()), save=save, confirm=self._confirm, now=self._now))
+
+    def _open_editor(self, dialog: HearingEditor) -> None:
+        try:
+            self._run_editor(dialog)
+        finally:
+            dialog.deleteLater()
+
+    def _save_values_elsewhere(self, sheet: Path, edited: Edited) -> str:
+        """Saves corrected values to a result that is no longer on screen, keeping its patient and what was sent."""
+        try:
+            saved = load_result(sheet)
+            history = saved.capture
+            if history and history[-1].get("ok"):
+                history += ({"ok": False, "code": EDITED_AFTER_SENDING, "error": "보낸 뒤 결과지를 고침", "retry": True,
+                             "at": self._now().isoformat(timespec="seconds")},)
+            moved = save_result(edited.result, sheet.parent, saved.received_at, saved.patient, edited.note, history,
+                                tested_at=edited.tested_at, clinic=saved.clinic or Clinic(), replacing=sheet,
+                                filed=saved.filed, remarks=edited.remarks)
+        except Exception as error:
+            self._log_unexpected(error)
+            return f"고친 값을 저장하지 못했습니다: {error}"
+        try:
+            refresh_copy(moved)
+        except (OSError, ValueError):
+            pass  # the result is saved; its copy catches up when it is next filed
+        if self._lost is not None and self._lost[0] == sheet:
+            self._lost = None  # what could not be saved there went with these values
+        self._problem = (f"⚠ 값을 고치는 동안 새 결과가 와서 화면이 바뀌었습니다. 고친 값은 앞 결과지({moved.name})에 "
+                         "저장했습니다. [지난 결과 열기...]로 열어 확인해 주세요.")
+        self._problem_is_about_edits = False
+        self._show_state()
+        return ""
+
     def _seen_tests(self) -> hearing_device.SeenTests:
         folder = self._settings_directory or settings_file.settings_directory()
         return hearing_device.SeenTests(folder / hearing_device.SEEN_FILE)
@@ -1927,6 +2065,7 @@ class MainWindow(QMainWindow):
     def _show_hearing(self) -> None:
         self.hearing_button.setVisible(self._settings.hearing_on)
         self.hearing_button.setEnabled(not self._receiving)
+        self.manual_button.setVisible(self._settings.hearing_on)
         text = self._hearing_text
         if self._receiving and self._hearing_progress:
             text = f"청력검사기에서 받는 중입니다... 검사 {self._hearing_progress}건"
