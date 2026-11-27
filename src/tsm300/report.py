@@ -242,7 +242,8 @@ def render(measurement: Measurement, path: Path, tested_at: datetime,
         _draw_reflexes(figure, labels, measurement)
         _draw_values(figure, labels, measurement, patient.age_on(tested_at.date()))
         _draw_note(figure, labels, note)
-        _draw_footer(figure, labels, measurement, clinic)
+        _draw_footer(figure, labels, labels["device"].format(name=measurement.device_name, memory_id=measurement.memory_id),
+                     clinic)
         options = {"quality": 95, "subsampling": 0} if Path(path).suffix.lower() in (".jpg", ".jpeg") else {}
         figure.savefig(path, dpi=DPI, pil_kwargs=options)
 
@@ -397,10 +398,9 @@ def _draw_note(figure: Figure, labels: dict, note: str) -> None:
         _text(figure, MARGIN + NOTE_PADDING, NOTE_TOP + 6.3 + index * 5.2, line, size=NOTE_FONT_SIZE)
 
 
-def _draw_footer(figure: Figure, labels: dict, measurement: Measurement, clinic: Clinic) -> None:
+def _draw_footer(figure: Figure, labels: dict, device: str, clinic: Clinic) -> None:
     """The clinic's address and telephone on the left; the device and this program on the right."""
     _rule(figure, 279)
-    device = labels["device"].format(name=measurement.device_name, memory_id=measurement.memory_id)
     source = f"{device} · TSM300 v{__version__}"
     _text(figure, PAGE_WIDTH - MARGIN, 284, source, size=8, color=INK_SECONDARY, ha="right")
     address, phone = _printable(clinic.address, labels), _printable(clinic.phone, labels)

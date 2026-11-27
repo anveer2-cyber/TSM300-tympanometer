@@ -11,6 +11,9 @@ from datetime import datetime
 from pathlib import Path
 
 from .clinic import Clinic
+from .hearing import record as hearing_record
+from .hearing import sheet as hearing_sheet
+from .hearing.record import HearingResult
 from .patient import Patient
 from .protocol import EarResult, Measurement, ProtocolError, parse_message, tympanogram_pressures
 from .report import render
@@ -22,10 +25,12 @@ _REPLACE_TRIES = 5
 _REPLACE_PAUSE = 0.2
 
 EXAM_KIND = "tymp"
-"""What kind of test a saved result holds, by the name 상쾌한캡처 gives it. Results of other
-tests (pure tone, speech) are meant to share the folder later; a file saved before this was
-written down holds a tympanogram."""
+"""What kind of test a saved result holds, by the name 상쾌한캡처 gives it. Tympanometry is
+``tymp`` and the audiometer's pure tone, speech and soundfield results are ``hearing``
+(``hearing.record.EXAM``); both share the folder. A file saved before this was written down
+holds a tympanogram."""
 FORMAT = 1
+HEARING = hearing_record.EXAM
 
 
 @dataclass(frozen=True)
@@ -33,7 +38,8 @@ class SavedResult:
     """One result as it lies on disk."""
 
     sheet: Path
-    measurement: Measurement
+    measurement: Measurement | HearingResult
+    """A tympanogram (``exam`` tymp) or a hearing result (``exam`` hearing)."""
     received_at: datetime
     """When the device sent it. The files are named after this, so it never changes."""
     tested_at: datetime
@@ -50,27 +56,46 @@ class SavedResult:
     """For a tidy copy itself: the sheet it is a copy of."""
 
 
-def result_to_dict(measurement: Measurement, received_at: datetime, patient: Patient, note: str = "",
+def result_to_dict(measurement: Measurement | HearingResult, received_at: datetime, patient: Patient, note: str = "",
                    capture: tuple[dict, ...] = (), tested_at: datetime | None = None,
                    clinic: Clinic = Clinic(), filed: str = "") -> dict:
-    return {
-        "format": FORMAT,
-        "exam": EXAM_KIND,
+    hearing = isinstance(measurement, HearingResult)
+    common = {
+        "format": hearing_record.FORMAT if hearing else FORMAT,
+        "exam": HEARING if hearing else EXAM_KIND,
         "received_at": received_at.isoformat(timespec="seconds"),
         "tested_at": (tested_at or received_at).isoformat(timespec="seconds"),
         "clinic": clinic.to_dict(),
         "patient": patient.to_dict(),
         "note": note,
-        "device": {"name": measurement.device_name, "code": measurement.device_code},
-        "memory_id": measurement.memory_id,
-        "right": _ear_to_dict(measurement.right),
-        "left": _ear_to_dict(measurement.left),
-        "capture": list(capture),
-        "filed": filed,
     }
+    if hearing:
+        values = hearing_record.record(measurement)
+    else:
+        values = {
+            "device": {"name": measurement.device_name, "code": measurement.device_code},
+            "memory_id": measurement.memory_id,
+            "right": _ear_to_dict(measurement.right),
+            "left": _ear_to_dict(measurement.left),
+        }
+    return {**common, **values, "capture": list(capture), "filed": filed}
 
 
-def save_result(measurement: Measurement, directory: Path, received_at: datetime,
+def exam_of_result(measurement: Measurement | HearingResult) -> str:
+    """The kind of test a result in memory holds, as its record will say."""
+    return HEARING if isinstance(measurement, HearingResult) else EXAM_KIND
+
+
+def draw(measurement: Measurement | HearingResult, path: Path, tested_at: datetime, patient: Patient = Patient(),
+         note: str = "", clinic: Clinic = Clinic()) -> None:
+    """Draws the sheet of either kind of result."""
+    if isinstance(measurement, HearingResult):
+        hearing_sheet.render(measurement, path, tested_at, patient, note, clinic)
+    else:
+        render(measurement, path, tested_at, patient, note, clinic)
+
+
+def save_result(measurement: Measurement | HearingResult, directory: Path, received_at: datetime,
                 patient: Patient = Patient(), note: str = "", capture: tuple[dict, ...] = (), *,
                 tested_at: datetime | None = None, clinic: Clinic = Clinic(),
                 replacing: Path | None = None, filed: str = "") -> Path:
@@ -89,7 +114,7 @@ def save_result(measurement: Measurement, directory: Path, received_at: datetime
     try:
         unfinished[".bin"].write_bytes(measurement.raw)
         unfinished[".json"].write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-        render(measurement, unfinished[".jpg"], tested_at or received_at, patient, note, clinic)
+        draw(measurement, unfinished[".jpg"], tested_at or received_at, patient, note, clinic)
         renamed = replacing is not None and replacing.with_suffix("") != directory / stem
         put_in_place(unfinished, {suffix: directory / f"{stem}{suffix}" for suffix in unfinished},
                      replacing if renamed else None)
@@ -140,9 +165,12 @@ def load_result(path: Path) -> SavedResult:
     sheet = path.with_suffix(".jpg")
     try:
         record = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
-        if exam_of(record) != EXAM_KIND:
+        if exam_of(record) == HEARING:
+            measurement = hearing_record.from_saved(path.with_suffix(".bin").read_bytes(), record)
+        elif exam_of(record) == EXAM_KIND:
+            measurement = parse_message(path.with_suffix(".bin").read_bytes())
+        else:
             raise ValueError(f"이 프로그램이 열 수 없는 종류의 검사 결과입니다 ({exam_of(record)})")
-        measurement = parse_message(path.with_suffix(".bin").read_bytes())
         received_at = datetime.fromisoformat(record["received_at"])
         tested_at = datetime.fromisoformat(record.get("tested_at") or record["received_at"])
     except FileNotFoundError as error:

@@ -110,3 +110,33 @@ def demo_memory():
         hf({"Ac R": ({8000: 20, 10000: 30, 12500: 45, 16000: 70}, {}), "Ac L": ({8000: 15, 10000: 25}, {})}, serial=s),
     ])
     return memory
+
+
+def practice_memory():
+    """The demo memory and one more made-up patient, who was tested the way the clinic tests a
+    hearing aid: pure tone with soundfield, speech, then soundfield again with the aid in, as
+    a test of its own. The simulated device in the program's practice mode holds this."""
+    memory = demo_memory()
+    s = DEMO_SERIAL
+    memory.add(4, "견본", "라", "20/05/1955", "F", [
+        tonal({
+            "Ac R": ({250: 40, 500: 45, 750: 50, 1000: 55, 1500: 60, 2000: 65, 3000: 70, 4000: 75, 6000: 80, 8000: 85},
+                     {}),
+            "Bc R": ({500: 35, 1000: 45, 2000: 55, 4000: 65}, {2000: 75}),
+            "Spkr R": ({500: 50, 1000: 55, 2000: 60, 4000: 70}, {}),
+            "Ac L": ({250: 30, 500: 35, 750: 40, 1000: 45, 1500: 50, 2000: 55, 3000: 60, 4000: 65, 6000: 75, 8000: 90},
+                     {8000: SILENT}),
+            "Bc L": ({500: 25, 1000: 35, 2000: 45, 4000: 55}, {}),
+            "Spkr L": ({500: 45, 1000: 50, 2000: 55, 4000: 65}, {}),
+        }, serial=s),
+        speech({"Ac R": [(60, 44, 245), (70, 64, 245), (80, 76, 55)],
+                "Ac L": [(50, 52, 245), (60, 72, 245), (70, 84, 245)],
+                "Spkr R": [(65, 56, 245)]},
+               srt={"Ac R": 55, "Ac L": 45, "Spkr R": 55}, serial=s, long_form=True, answers=True,
+               correct={"Ac R": [11, 16, 19], "Ac L": [13, 18, 21], "Spkr R": [14]}),
+        tonal({"Spkr R": ({500: 30, 1000: 30, 2000: 35, 4000: 45}, {}),
+               "Spkr L": ({500: 30, 1000: 35, 2000: 35, 4000: 50}, {})}, serial=s),
+        speech({"Spkr R": [(50, 84, 245)]}, srt={"Spkr R": 35}, serial=s, long_form=True, answers=True,
+               correct={"Spkr R": [21]}),
+    ])
+    return memory
