@@ -66,6 +66,8 @@ class Order:
     time: str = ""
     label: str = ""
     room: str = ""
+    codes: tuple[str, ...] = ()
+    """The order codes, which tell the tests ordered apart (see ``records.exams_of``)."""
 
     @property
     def selectable(self) -> bool:
@@ -80,7 +82,7 @@ class PatientSource(Protocol):
         """The patient with this chart number, or None when there is no such chart."""
 
     def todays_orders(self) -> list[Order]:
-        """Patients with a tympanometry order today."""
+        """Patients with a tympanometry order today, and a hearing test order when the audiometer is used."""
 
     def internal_number(self, chart_no: str) -> str:
         """The records' own number for a chart number looked up earlier, or "" when not known."""

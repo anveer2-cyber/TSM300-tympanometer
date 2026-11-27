@@ -18,7 +18,8 @@ from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateTimeEdit, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-    QProgressBar, QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QProgressBar, QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from . import __version__, links
@@ -27,10 +28,13 @@ from . import settings as settings_file
 from .archive import archive_directory, file_result, filed_sheet, refresh_copy
 from .clinic import Clinic
 from .console import available_ports, open_port
+from .hearing import device as hearing_device
+from .hearing.record import HearingResult, MergeError, Part, can_be_aided, describe, device_birth_date, type_of
+from .hearing.session import fingerprint
 from .listen import RETRY_AFTER, open_file, read_events
 from .patient import Order, Patient, PatientSource, parse_birth_date
 from .protocol import Corrupt, Measurement, PowerOn
-from .records import Records, charts_tested_on, records_from_settings, send_sheet
+from .records import EXAM_NAMES, Records, exams_of, records_from_settings, send_sheet, tested_on
 from .report import prepare, wrap_note
 from .settings import Settings
 from .shortcut import ICON, claim_taskbar_identity
@@ -52,6 +56,10 @@ DONE_INK = QColor("#9a9a9a")
 NO_PORT = "시리얼 포트를 찾지 못했습니다. USB-시리얼 케이블을 꽂으면 자동으로 연결합니다."
 NO_CLINIC_HINT = "결과지에 인쇄할 병원 이름이 비어 있습니다. [설정] → 병원 정보에서 넣어 주세요."
 ALREADY_RUNNING = "TSM300 이 이미 켜져 있습니다.\n작업 표시줄에서 열려 있는 창을 찾아 주세요."
+HEARING_LABEL = "청력검사기에서 받기"
+WAITING_WITH_HEARING = ("검사 결과를 기다리는 중입니다. 임피던스는 검사 후 장비의 → 키를, "
+                        "청력검사는 검사를 마친 뒤 [청력검사기에서 받기]를 누르세요.")
+HEARING_PROGRESS_MS = 200
 
 Background = Callable[[QObject, Callable[[], object], Callable[[object, "Exception | None"], None]], None]
 
@@ -198,11 +206,14 @@ class SettingsDialog(QDialog):
     where patients are looked up and where sheets are sent."""
 
     def __init__(self, parent: QWidget | None, settings: Settings, background: Background = run_in_background,
-                 ports: Callable[[], list] = available_ports, fixed_folder: Path | None = None) -> None:
+                 ports: Callable[[], list] = available_ports, fixed_folder: Path | None = None,
+                 hearing_opener: Callable[[str], Callable[[], object]] = hearing_device.opener_for) -> None:
         super().__init__(parent)
         self._original = settings
         self._background = background
         self._ports = ports
+        self._fixed_folder = fixed_folder
+        self._hearing_opener = hearing_opener
         self.setWindowTitle("설정")
         self.setMinimumWidth(560)
         layout = QVBoxLayout(self)
@@ -212,6 +223,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._device_tab(settings, fixed_folder), "장비 · 저장")
         self.tabs.addTab(self._lookup_tab(settings), "환자 조회")
         self.tabs.addTab(self._capture_tab(settings), "상쾌한캡처")
+        self.tabs.addTab(self._hearing_tab(settings), "청력검사기")
         self.tabs.addTab(self._about_tab(), "프로그램 정보")
         self.problem_label = QLabel()
         self.problem_label.setWordWrap(True)
@@ -332,13 +344,47 @@ class SettingsDialog(QDialog):
         form.addRow(_note("결과지를 상쾌한캡처 프로그램으로 보내는 기능입니다. 상쾌한캡처를 쓰지 않으면 비워 둡니다."))
         return tab
 
+    def _hearing_tab(self, settings: Settings) -> QWidget:
+        tab = QWidget()
+        form = QFormLayout(tab)
+        self.hearing_on_check = QCheckBox("청력검사기(MRS Resonance) 쓰기")
+        self.hearing_on_check.setChecked(settings.hearing_on)
+        form.addRow(self.hearing_on_check)
+        self.hearing_link_combo = QComboBox()
+        for label, value in (("USB (자동으로 찾음)", hearing_device.USB),
+                             ("모의 장비 (연습 · 시연용, 실제 청력검사기가 아님)", hearing_device.SIMULATOR)):
+            self.hearing_link_combo.addItem(label, value)
+        self.hearing_link_combo.setCurrentIndex(max(0, self.hearing_link_combo.findData(settings.hearing_link)))
+        form.addRow("연결", self.hearing_link_combo)
+        self.hearing_log_check = QCheckBox("주고받은 바이트 기록 남기기")
+        self.hearing_log_check.setChecked(settings.hearing_log)
+        form.addRow(self.hearing_log_check)
+        self.hearing_test_button = QPushButton("연결 시험")
+        self.hearing_test_button.clicked.connect(self.test_hearing)
+        self.hearing_result = QLabel()
+        self.hearing_result.setWordWrap(True)
+        self.hearing_result.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        form.addRow(self.hearing_test_button, self.hearing_result)
+        form.addRow(_note(
+            "켜면 창 위쪽에 [청력검사기에서 받기]가 생깁니다. 순음 · 어음 · 음장 검사를 기기에 저장한 뒤 누르면 "
+            "기기의 검사를 읽어 와 결과지로 만듭니다. 기기의 검사는 지우지 않고 읽기만 합니다.\n"
+            "USB: 청력검사기를 USB 선으로 이 PC 에 연결합니다. 제조사 프로그램(MDS)이 켜져 있으면 연결되지 않으니 닫아 주세요. "
+            "MRS 드라이버는 설치되어 있어야 합니다.\n"
+            "모의 장비: 실제 기기 없이 받기를 연습하는 가짜 청력검사기입니다. 견본 환자의 검사가 들어 있습니다. "
+            "실제 검사에는 쓰지 마세요.\n"
+            f"바이트 기록: 저장 폴더 안의 '{hearing_device.LOG_FOLDER}' 폴더에 받을 때마다 파일이 하나씩 생깁니다. "
+            "처음 몇 번은 켜 두세요. 문제가 생겼을 때 원인을 찾는 데 씁니다.\n"
+            "[연결 시험]은 기기에게 누구인지 묻기만 합니다."))
+        return tab
+
     def _about_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         folder = settings_file.settings_directory()
         about = QLabel(
             f"TSM300 v{__version__}\n"
-            "Oscilla TSM-300 임피던스 청력검사기의 결과를 받아 결과지로 만드는 프로그램입니다.\n\n"
+            "Oscilla TSM-300 임피던스 청력검사기의 결과를 받아 결과지로 만드는 프로그램입니다. "
+            "MRS Resonance 청력검사기의 순음 · 어음 · 음장 검사 결과도 받을 수 있습니다.\n\n"
             f"설정 파일: {folder / settings_file.FILE_NAME}\n"
             f"오류 기록: {folder / 'error.log'}\n\n"
             "이 프로그램은 다음 공개 소프트웨어를 사용합니다. 각 소프트웨어의 저작권과 사용 조건은 해당 프로젝트에 있습니다.\n"
@@ -367,6 +413,9 @@ class SettingsDialog(QDialog):
             cap_url=self.cap_url_edit.text().strip(),
             cap_key=self.cap_key_edit.text().strip(),
             cap_on=self.cap_on_check.isChecked(),
+            hearing_on=self.hearing_on_check.isChecked(),
+            hearing_link=self.hearing_link_combo.currentData(),
+            hearing_log=self.hearing_log_check.isChecked(),
         )
 
     def accept(self) -> None:
@@ -404,6 +453,23 @@ class SettingsDialog(QDialog):
                 self.capture_result.setText(f"✔ 연결됨: {result.get('device')} → {result.get('pc')}")
 
         self._background(self, lambda: links.entcapture_hello(edited.cap_url, edited.cap_key), done)
+
+    def test_hearing(self) -> None:
+        """Asks the audiometer who it is, and nothing else, with the connection chosen in the dialog."""
+        edited = self.settings()
+        folder = None
+        if edited.hearing_log:
+            results = self._fixed_folder or settings_file.results_directory(edited.results_dir)
+            folder = Path(os.path.abspath(results)) / hearing_device.LOG_FOLDER
+        opener = self._hearing_opener(edited.hearing_link)
+        self.hearing_test_button.setEnabled(False)
+        self.hearing_result.setText("청력검사기에 묻는 중...")
+
+        def done(result, error) -> None:
+            self.hearing_test_button.setEnabled(True)
+            self.hearing_result.setText(f"⚠ {error}" if error else f"✔ {result}")
+
+        self._background(self, lambda: hearing_device.check(opener, folder), done)
 
     def _list_ports(self, chosen: str | None) -> None:
         """Fills the port list, keeping the chosen port in it even while its cable is unplugged."""
@@ -455,6 +521,225 @@ def _note(text: str) -> QLabel:
     label.setWordWrap(True)
     label.setStyleSheet("color: #666666;")
     return label
+
+
+class HearingReceiveDialog(QDialog):
+    """The tests fetched from the audiometer, under the device's patients they were saved for,
+    for the operator to choose those of the patient in the window.
+
+    Only tests not saved before are listed, unless the operator asks for all of them. The
+    newest device patient's new tests are chosen to start with. The chosen tests become one
+    sheet; a test with soundfield curves only may be marked as done with hearing aids.
+    """
+
+    TEST, AIDED, ORDER = range(3)
+
+    def __init__(self, parent: QWidget | None, fetched, seen: set[str], patient: Patient, patient_is_new: bool,
+                 received_at: datetime) -> None:
+        super().__init__(parent)
+        self._download = fetched.download
+        self._seen = seen
+        self._patient = patient
+        self._choice: tuple[HearingResult, bool] | None = None
+        self._tests: dict[tuple[int, int], tuple] = {}
+        self._chosen: set[tuple[int, int]] = set()
+        self._aided: set[tuple[int, int]] = set()
+        self._filling = False
+        self.setWindowTitle("청력검사기에서 받은 검사")
+        self.setMinimumSize(700, 520)
+        layout = QVBoxLayout(self)
+
+        self.patient_check = QCheckBox()
+        self.patient_note = QLabel()
+        self.patient_note.setWordWrap(True)
+        if patient.is_empty:
+            self.patient_check.setVisible(False)
+            self.patient_note.setText("환자를 고르지 않았습니다. 환자 정보 없이 결과지를 만듭니다. "
+                                      "만든 뒤 환자 정보를 넣고 [이 환자 정보로 저장]을 누르세요.")
+            self.patient_note.setStyleSheet("color: #b3261e;")
+        else:
+            self.patient_check.setText(f"{_who(patient)} 환자의 검사입니다")
+            self.patient_check.setStyleSheet("font-size: 15px; font-weight: 700;")
+            self.patient_check.setChecked(patient_is_new)
+            self.patient_check.toggled.connect(self._show_patient_note)
+        layout.addWidget(self.patient_check)
+        layout.addWidget(self.patient_note)
+        self._patient_is_new = patient_is_new
+        self._show_patient_note()
+
+        tests = list({fingerprint(test): test for test in self._download.tests}.values())
+        new = [test for test in tests if fingerprint(test) not in seen]
+        serial = self._download.serial or (tests[0].packet.serial if tests else "")
+        self.summary = QLabel(f"기기 {serial or '일련번호 모름'} · 새 검사 {len(new)}건 · 기기에 있는 검사 {len(tests)}건"
+                              + ("" if new else "\n새 검사가 없습니다. 이미 받은 검사를 다시 만들려면 [이미 받은 검사도 보기]를 켜세요."))
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        warnings = fetched.warnings
+        self.warning_label = QLabel("\n".join(f"⚠ {text}" for text in warnings))
+        self.warning_label.setWordWrap(True)
+        self.warning_label.setStyleSheet("color: #8c1d18;")
+        self.warning_label.setVisible(bool(warnings))
+        layout.addWidget(self.warning_label)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(3)
+        self.tree.setHeaderLabels(["검사 (기기에 입력된 환자별)", "보청기 착용", "받은 순서"])
+        self.tree.header().setSectionResizeMode(self.TEST, QHeaderView.ResizeMode.Stretch)
+        self.tree.header().setSectionResizeMode(self.AIDED, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(self.ORDER, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setStretchLastSection(False)
+        self.tree.itemChanged.connect(self._item_changed)
+        layout.addWidget(self.tree, stretch=1)
+        self.all_check = QCheckBox("이미 받은 검사도 보기")
+        self.all_check.toggled.connect(self._show_all)
+        layout.addWidget(self.all_check)
+        layout.addWidget(_note(
+            "이 환자의 검사에 체크하세요. 체크한 검사가 결과지 한 장이 됩니다 (순음 + 어음 + 고주파).\n"
+            "보청기를 끼고 한 음장검사는 [보청기 착용]에 체크하면 같은 결과지에 '음장 보청기'로 들어갑니다.\n"
+            f"검사일시는 받은 시각({received_at:%Y-%m-%d %H:%M})으로 적습니다. 다르면 만든 뒤 [화면의 결과지 고치기]에서 고칩니다."))
+        self.problem_label = QLabel()
+        self.problem_label.setWordWrap(True)
+        self.problem_label.setStyleSheet("color: #b3261e;")
+        layout.addWidget(self.problem_label)
+        buttons = QDialogButtonBox()
+        self.ok_button = buttons.addButton("결과지 만들기", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton("취소", QDialogButtonBox.ButtonRole.RejectRole)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        # A test can come twice in one reading: old firmware pushes the newest test as soon as it is
+        # asked who it is, before the memory follows. The copy under its patient is the one listed.
+        last = {}
+        order = 0
+        for group_index, group in enumerate(self._download.groups):
+            for test_index, test in enumerate(group.tests):
+                order += 1
+                last[fingerprint(test)] = (group_index, test_index, order)
+        newest = None
+        for group_index, test_index, order in sorted(last.values()):
+            group = self._download.groups[group_index]
+            test = group.tests[test_index]
+            fresh = fingerprint(test) not in seen
+            self._tests[(group_index, test_index)] = (group, test, order, fresh)
+            if fresh and type_of(test):
+                newest = group_index
+        if newest is not None:
+            self._chosen = {key for key, (_, test, _, fresh) in self._tests.items()
+                            if key[0] == newest and fresh and type_of(test)}
+        self._fill()
+
+    def choice(self) -> tuple[HearingResult, bool] | None:
+        """The sheet made of the chosen tests, and whether it is the patient's in the window."""
+        return self._choice
+
+    def chosen_keys(self) -> set[tuple[int, int]]:
+        return set(self._chosen)
+
+    def set_chosen(self, key: tuple[int, int], chosen: bool = True, aided: bool | None = None) -> None:
+        """Ticks a test, as the operator would."""
+        item = self._items.get(key)
+        if item is None:
+            raise KeyError(key)
+        item.setCheckState(self.TEST, Qt.CheckState.Checked if chosen else Qt.CheckState.Unchecked)
+        if aided is not None:
+            item.setCheckState(self.AIDED, Qt.CheckState.Checked if aided else Qt.CheckState.Unchecked)
+
+    def accept(self) -> None:
+        keys = [key for key in sorted(self._tests) if key in self._chosen]
+        if not keys:
+            self.problem_label.setText("결과지에 넣을 검사를 하나 이상 고르세요.")
+            return
+        parts = []
+        for key in keys:
+            group, test, _, _ = self._tests[key]
+            parts.append(Part(test, group.patient, key in self._aided))
+        try:
+            result = HearingResult(tuple(parts))
+        except MergeError as error:
+            self.problem_label.setText(f"⚠ {error}")
+            return
+        self._choice = (result, not self._patient.is_empty and self.patient_check.isChecked())
+        super().accept()
+
+    def _show_patient_note(self) -> None:
+        if self._patient.is_empty:
+            return
+        if self.patient_check.isChecked():
+            text, color = "체크한 검사를 이 환자의 결과로 저장합니다.", "#666666"
+        elif self._patient_is_new:
+            text, color = "체크하지 않으면 환자 정보 없이 저장합니다.", "#b3261e"
+        else:
+            text, color = ("화면의 환자 정보는 앞 검사에 쓴 것입니다. 같은 환자의 검사면 위에 체크하세요. "
+                           "체크하지 않으면 환자 정보 없이 저장합니다."), "#b3261e"
+        self.patient_note.setText(text)
+        self.patient_note.setStyleSheet(f"color: {color};")
+
+    def _show_all(self, shown: bool) -> None:
+        if not shown:  # what can no longer be seen must not go on the sheet unseen
+            self._chosen = {key for key in self._chosen if self._tests[key][3]}
+        self._fill()
+
+    def _fill(self) -> None:
+        self._filling = True
+        self.tree.clear()
+        self._items: dict[tuple[int, int], QTreeWidgetItem] = {}
+        everything = self.all_check.isChecked()
+        for group_index, group in enumerate(self._download.groups):
+            keys = [key for key in sorted(self._tests) if key[0] == group_index and (everything or self._tests[key][3])]
+            if not keys:
+                continue
+            heading = QTreeWidgetItem([self._group_text(group), "", ""])
+            heading.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            font = heading.font(self.TEST)
+            font.setBold(True)
+            heading.setFont(self.TEST, font)
+            self.tree.addTopLevelItem(heading)
+            for key in keys:
+                _, test, order, fresh = self._tests[key]
+                text = describe(test) + ("" if fresh else "  (이미 받음)")
+                item = QTreeWidgetItem([text, "", str(order)])
+                if type_of(test):
+                    item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(self.TEST, Qt.CheckState.Checked if key in self._chosen else Qt.CheckState.Unchecked)
+                    if can_be_aided(test):
+                        item.setCheckState(self.AIDED,
+                                           Qt.CheckState.Checked if key in self._aided else Qt.CheckState.Unchecked)
+                else:
+                    item.setFlags(Qt.ItemFlag.NoItemFlags)
+                if not fresh or not type_of(test):
+                    item.setForeground(self.TEST, DONE_INK)
+                heading.addChild(item)
+                self._items[key] = item
+            heading.setExpanded(True)
+        self._filling = False
+
+    def _group_text(self, group) -> str:
+        device_patient = group.patient
+        if device_patient is None:
+            return "기기 환자 정보 없음"
+        parts = [f"기기 환자 {device_patient.number}", device_patient.name or "(이름 없음)"]
+        parts += [part for part in (device_patient.birth_date, device_patient.sex) if part]
+        text = " · ".join(parts)
+        born = device_birth_date(device_patient)
+        if born and self._patient.birth_date and born != self._patient.birth_date:
+            text += f"  ⚠ 생년월일이 화면의 환자({self._patient.birth_date.isoformat()})와 다릅니다"
+        return text
+
+    def _item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        if self._filling:
+            return
+        key = next((key for key, shown in self._items.items() if shown is item), None)
+        if key is None:
+            return
+        target = self._chosen if column == self.TEST else self._aided if column == self.AIDED else None
+        if target is None:
+            return
+        if item.checkState(column) == Qt.CheckState.Checked:
+            target.add(key)
+        else:
+            target.discard(key)
+        self.problem_label.setText("")
 
 
 class UpdateDialog(QDialog):
@@ -571,7 +856,10 @@ class MainWindow(QMainWindow):
                  background: Background = run_in_background,
                  send: Callable[..., dict] = send_sheet,
                  settings_directory: Path | None = None, updates=update_module,
-                 directory_follows_settings: bool = False) -> None:
+                 directory_follows_settings: bool = False,
+                 hearing_opener: Callable[[str], Callable[[], object]] = hearing_device.opener_for,
+                 choose_hearing: Callable[..., tuple | None] | None = None,
+                 fetch_hearing: Callable[..., object] = hearing_device.fetch) -> None:
         super().__init__()
         self._directory = _full(directory)
         self._directory_follows_settings = directory_follows_settings
@@ -606,6 +894,12 @@ class MainWindow(QMainWindow):
         self._going: Path | None = None
         self._outbox: list[tuple] = []
         self._sent: dict | None = None
+        self._hearing_opener = hearing_opener
+        self._choose_hearing = choose_hearing or self._ask_hearing
+        self._fetch_hearing = fetch_hearing
+        self._receiving = False
+        self._hearing_progress = 0
+        self._hearing_text = ""
         self._no_wheel = NoWheel(self)
         self.setWindowTitle(f"TSM-300 임피던스 청력검사 v{__version__}")
         self.resize(1240, 840)
@@ -614,7 +908,11 @@ class MainWindow(QMainWindow):
         self._orders_timer.setInterval(ORDERS_REFRESH_MS)
         self._orders_timer.timeout.connect(self.refresh_orders)
         self._orders_timer.start()
+        self._hearing_timer = QTimer(self)
+        self._hearing_timer.setInterval(HEARING_PROGRESS_MS)
+        self._hearing_timer.timeout.connect(self._show_hearing)
         self._show_source()
+        self._show_hearing()
         self._show_state()
 
     # ----- layout -------------------------------------------------------------------------
@@ -647,6 +945,11 @@ class MainWindow(QMainWindow):
         self.connection_label = QLabel(self._connection)
         self.connection_label.setStyleSheet("color: #666666;")
         top.addWidget(self.connection_label, stretch=1)
+        self.hearing_button = QPushButton(HEARING_LABEL)
+        self.hearing_button.setStyleSheet("font-weight: 700; padding: 6px 14px;")
+        self.hearing_button.setToolTip("청력검사기(MRS Resonance)에 저장된 순음 · 어음 · 음장 검사를 읽어 와 결과지로 만듭니다.")
+        self.hearing_button.clicked.connect(self.receive_hearing)
+        top.addWidget(self.hearing_button)
         update_button = QPushButton("업데이트")
         update_button.clicked.connect(self.open_update)
         top.addWidget(update_button)
@@ -659,6 +962,11 @@ class MainWindow(QMainWindow):
         self.state_label.setStyleSheet("font-size: 15px; font-weight: 600; padding: 10px 12px;"
                                        " background: #f3f3f3; border-radius: 6px;")
         main.addWidget(self.state_label)
+        self.hearing_label = QLabel()
+        self.hearing_label.setWordWrap(True)
+        self.hearing_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.hearing_label.setStyleSheet("padding: 0 12px;")
+        main.addWidget(self.hearing_label)
         self.problem_label = QLabel()
         self.problem_label.setWordWrap(True)
         self.problem_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -809,7 +1117,8 @@ class MainWindow(QMainWindow):
 
     def open_settings(self) -> None:
         fixed_folder = None if self._directory_follows_settings else self._directory
-        dialog = SettingsDialog(self, self._settings, self._background, fixed_folder=fixed_folder)
+        dialog = SettingsDialog(self, self._settings, self._background, fixed_folder=fixed_folder,
+                                hearing_opener=self._hearing_opener)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
@@ -841,6 +1150,7 @@ class MainWindow(QMainWindow):
                 self._sheet_clinic = settings.clinic  # also if the sheet cannot be rewritten now: the next save carries it
                 self._save_again(self._sheet_patient, self._note_text(), send=False, tested_at=self._tested_value())
         self._show_source()
+        self._show_hearing()
         self._show_state()
 
     def remember_port(self, port: str, adapter: str = "") -> None:
@@ -946,17 +1256,28 @@ class MainWindow(QMainWindow):
 
     def _show_orders(self) -> None:
         today = self._now().date()
-        done_charts = charts_tested_on(self._directory, today)
+        done = tested_on(self._directory, today)
+        hearing = self._settings.hearing_on
         chosen = self.chart_edit.text().strip()
         self.orders_table.setRowCount(len(self._orders))
+        waiting = 0
         for row, order in enumerate(self._orders):
             patient = order.patient
             age = patient.age_on(today)
             who = " ".join(part for part in (f"{age}세" if age is not None else "", patient.sex) if part)
-            tested = patient.chart_no in done_charts
-            cells = (order.time, patient.chart_no, patient.name, who, order.room, "✓" if tested else "")
+            kinds = exams_of(order.codes)
+            finished = [kind for kind in kinds if patient.chart_no in done.get(kind, set())]
+            tested = len(finished) == len(kinds)
+            if hearing:  # which of the tests ordered, and which of them are done
+                mark = " · ".join(EXAM_NAMES[kind] + (" ✓" if kind in finished else "") for kind in kinds)
+            else:
+                mark = "✓" if tested else ""
+            waiting += order.selectable and not tested
+            cells = (order.time, patient.chart_no, patient.name, who, order.room, mark)
             for column, text in enumerate(cells):
                 item = QTableWidgetItem(text)
+                if order.label:
+                    item.setToolTip(order.label)
                 if not order.selectable:
                     item.setFlags(Qt.ItemFlag.NoItemFlags)
                 if tested or not order.selectable:
@@ -964,12 +1285,12 @@ class MainWindow(QMainWindow):
                 self.orders_table.setItem(row, column, item)
             if order.selectable and chosen and patient.chart_no == chosen:
                 self.orders_table.selectRow(row)
-        waiting = sum(1 for order in self._orders if order.selectable and order.patient.chart_no not in done_charts)
         if self._orders:
             self.orders_note.setText(
                 f"{len(self._orders)}명 (검사 전 {waiting}명) · {self._now():%H:%M:%S} 읽음 · 30초마다 다시 읽습니다")
         else:
-            self.orders_note.setText(f"오늘 임피던스 검사 오더가 없습니다. · {self._now():%H:%M:%S} 읽음")
+            what = "임피던스 · 청력검사" if hearing else "임피던스 검사"
+            self.orders_note.setText(f"오늘 {what} 오더가 없습니다. · {self._now():%H:%M:%S} 읽음")
 
     def _order_chosen(self, row: int, _column: int) -> None:
         order = self._orders[row]
@@ -1242,22 +1563,25 @@ class MainWindow(QMainWindow):
             self.state_label.setText(
                 f"장비의 ID {measurement.memory_id} 에는 저장된 검사가 없습니다. 검사 후 다시 전송해 주세요.")
             return
-        if self._measurement is not None and measurement.raw == self._measurement.raw:
+        if isinstance(self._measurement, Measurement) and measurement.raw == self._measurement.raw:
             self.state_label.setText("같은 결과를 다시 받았습니다. 이미 저장되어 있습니다.")
             return
         try:
             patient = self.patient() if self._patient_is_new else Patient()
         except ValueError:
             patient = Patient()
+        self._result_arrived(measurement, patient, self._now())
+
+    def _result_arrived(self, measurement: Measurement | HearingResult, patient: Patient, received_at: datetime) -> bool:
+        """Saves a result that has just come from a device and shows it. False when it could not be saved."""
         lost = None if self._keep_unsaved_edits() else (self._sheet, self._note_text(), self._tested_value())
-        received_at = self._now()
         tested_at = _minute(received_at)
         try:
             sheet = save_result(measurement, self._directory, received_at, patient,
                                 tested_at=tested_at, clinic=self._settings.clinic)
         except Exception as error:  # a full disk, a folder that has gone, a sheet that cannot be drawn
             self._could_not_save(measurement, received_at, error)
-            return
+            return False
         self._measurement, self._received_at = measurement, received_at
         self._sheet_clinic = self._settings.clinic
         self._sent = None
@@ -1270,6 +1594,7 @@ class MainWindow(QMainWindow):
             self._show_state()
         if self._settings.cap_on:
             self._send_when_possible()
+        return True
 
     def _lost_text(self) -> str:
         """What is said while corrections to an earlier result are waiting to be saved: they could
@@ -1281,7 +1606,7 @@ class MainWindow(QMainWindow):
         return (f"⚠ 앞 결과지({sheet.name})에 고치던 내용을 저장하지 못했습니다. [지난 결과 열기...]로 그 결과를 열면 "
                 f"아래 내용이 다시 채워집니다.\n검사일시: {tested_at:%Y-%m-%d %H:%M} · 메모: {note or '(없음)'}")
 
-    def _could_not_save(self, measurement: Measurement, received_at: datetime, error: Exception) -> None:
+    def _could_not_save(self, measurement: Measurement | HearingResult, received_at: datetime, error: Exception) -> None:
         """Keeps what the device sent and says what to do. The result shown before stays as it was,
         and the patient in the form stays in line, so sending again from the device is all it takes."""
         folder = (self._settings_directory or settings_file.settings_directory()) / "unsaved"
@@ -1295,8 +1620,10 @@ class MainWindow(QMainWindow):
             pass
         if not isinstance(error, OSError):
             write_error_log(folder.parent, "".join(traceback.format_exception(type(error), error, error.__traceback__)))
+        again = ("[청력검사기에서 받기]를 다시 눌러 주세요" if isinstance(measurement, HearingResult)
+                 else "장비에서 → 키를 다시 눌러 주세요")
         self._problem = (f"⚠ 방금 받은 결과를 저장하지 못했습니다: {error}\n저장 폴더({self._directory})를 확인한 뒤 "
-                         f"장비에서 → 키를 다시 눌러 주세요.{kept}")
+                         f"{again}.{kept}")
         self._problem_is_about_edits = False
         self._show_state()
 
@@ -1368,6 +1695,10 @@ class MainWindow(QMainWindow):
                 "고치던 검사일시와 메모를 저장하지 못했습니다.\n결과지를 다른 프로그램에서 열어 두었다면 닫고 다시 해 주세요.\n\n"
                 "저장하지 않고 프로그램을 닫을까요?"):
             return False
+        if self._receiving and not self._confirm(
+                "청력검사기에서 검사를 받는 중입니다.\n지금 닫으면 받던 검사는 결과지로 만들지 않습니다. "
+                "기기의 검사는 그대로 있으니 다음에 다시 받으면 됩니다.\n\n지금 닫을까요?"):
+            return False
         unsent = len(self._outbox) + (1 if self._sending else 0)
         if unsent and not self._confirm(
                 f"상쾌한캡처로 아직 다 보내지 못한 결과지가 {unsent}건 있습니다.\n지금 닫으면 보내지지 않을 수 있습니다. "
@@ -1438,9 +1769,9 @@ class MainWindow(QMainWindow):
         self.save_button.setText(SAVE_LABEL)
         self.save_button.setEnabled(False)
         if not has_result:
-            text = WAITING
+            text = WAITING_WITH_HEARING if self._settings.hearing_on else WAITING
             if next_up:
-                text = f"다음 검사는 {_who(patient)} 환자로 저장됩니다. " + WAITING
+                text = f"다음 검사는 {_who(patient)} 환자로 저장됩니다. " + text
         elif saved_for.is_empty:
             self.save_button.setEnabled(not patient.is_empty)
             if patient.is_empty:
@@ -1522,6 +1853,87 @@ class MainWindow(QMainWindow):
 
     def _ask_patient(self, patient: Patient) -> bool:
         return PatientConfirm(self, patient, self._now().date()).exec() == QDialog.DialogCode.Accepted
+
+    # ----- the audiometer -----------------------------------------------------------------
+
+    def receive_hearing(self) -> None:
+        """Reads every test in the audiometer's memory on a thread of its own, then offers the new ones."""
+        if self._receiving or not self._settings.hearing_on:
+            return
+        opener = self._hearing_opener(self._settings.hearing_link)
+        log_folder = self._directory / hearing_device.LOG_FOLDER if self._settings.hearing_log else None
+        self._receiving, self._hearing_progress = True, 0
+        self._hearing_text = "청력검사기에서 받는 중입니다..."
+        self._hearing_timer.start()
+        self._show_hearing()
+
+        def note_progress(count: int) -> None:  # called on the receiving thread
+            self._hearing_progress = count
+
+        def done(fetched, error) -> None:
+            self._receiving = False
+            self._hearing_timer.stop()
+            if error is not None:
+                self._hearing_text = f"⚠ 청력검사기에서 받지 못했습니다. {error}"
+                self._show_hearing()
+                return
+            self._hearing_fetched(fetched)
+
+        self._background(self, lambda: self._fetch_hearing(opener, log_folder, note_progress), done)
+
+    def _hearing_fetched(self, fetched) -> None:
+        """Lets the operator choose the tests of the patient in the window, and saves them as one sheet."""
+        received_at = self._now()
+        seen_tests = self._seen_tests()
+        seen = seen_tests.load()
+        try:
+            patient = self.patient()
+        except ValueError:
+            patient = Patient()
+        logged = f"\n주고받은 기록: {fetched.log}" if fetched.log else ""
+        choice = self._choose_hearing(fetched, seen, patient, self._patient_is_new, received_at)
+        if choice is None:
+            self._hearing_text = "받은 검사로 결과지를 만들지 않았습니다. 다시 하려면 [청력검사기에서 받기]를 누르세요." + logged
+            self._show_hearing()
+            return
+        result, with_patient = choice
+        if not self._result_arrived(result, patient if with_patient else Patient(), received_at):
+            self._hearing_text = ""
+            self._show_hearing()
+            return
+        try:
+            seen_tests.add(result.fingerprints, self._sheet.name, received_at)
+        except OSError as error:
+            self._problem = (f"⚠ 받은 검사를 기억해 두지 못했습니다: {error}\n"
+                             "다음에 받을 때 이 검사가 새 검사로 다시 보일 수 있습니다.")
+            self._show_state()
+        left = [test for _, test in fetched.download.new_since(seen | set(result.fingerprints)) if type_of(test)]
+        self._hearing_text = f"✔ 청력검사기에서 받은 검사 {len(result.parts)}건으로 결과지를 만들었습니다."
+        if left:
+            self._hearing_text += (f" 아직 결과지로 만들지 않은 새 검사가 {len(left)}건 있습니다. "
+                                   "다른 환자의 것이면 그 환자를 고른 뒤 다시 받으세요.")
+        self._hearing_text += logged
+        self._show_hearing()
+
+    def _seen_tests(self) -> hearing_device.SeenTests:
+        folder = self._settings_directory or settings_file.settings_directory()
+        return hearing_device.SeenTests(folder / hearing_device.SEEN_FILE)
+
+    def _ask_hearing(self, fetched, seen: set[str], patient: Patient, patient_is_new: bool,
+                     received_at: datetime) -> tuple | None:
+        dialog = HearingReceiveDialog(self, fetched, seen, patient, patient_is_new, received_at)
+        return dialog.choice() if dialog.exec() == QDialog.DialogCode.Accepted else None
+
+    def _show_hearing(self) -> None:
+        self.hearing_button.setVisible(self._settings.hearing_on)
+        self.hearing_button.setEnabled(not self._receiving)
+        text = self._hearing_text
+        if self._receiving and self._hearing_progress:
+            text = f"청력검사기에서 받는 중입니다... 검사 {self._hearing_progress}건"
+        if not self._settings.hearing_on and not self._receiving:
+            text = ""
+        self.hearing_label.setText(text)
+        self.hearing_label.setVisible(bool(text))
 
 
 def paint_sheet(sheet: Path, printer: QPrinter) -> None:

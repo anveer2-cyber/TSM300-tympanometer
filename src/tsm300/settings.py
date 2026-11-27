@@ -49,6 +49,12 @@ class Settings:
     """Where results are kept; empty for the usual folder (see ``results_directory``)."""
     archive_dir: str = ""
     """Where finished results are filed by date; empty for a folder inside the results folder."""
+    hearing_on: bool = False
+    """Whether the window offers to fetch results from an MRS Resonance audiometer."""
+    hearing_link: str = "usb"
+    """How the audiometer is reached: ``usb``, or ``simulator`` for a made-up device to practise on."""
+    hearing_log: bool = True
+    """Whether every byte to and from the audiometer is written to a log in the results folder."""
 
     @property
     def capture_ready(self) -> bool:

@@ -24,6 +24,11 @@ import uuid
 # 수가표의 임피던스 청력검사 코드. 실제 오더는 거의 F6361(고막운동성계측)
 TYMP_CODES = ('F6361', 'F6362', 'F6363')
 TYMP_NAMES = {'F6361': '고막운동성계측', 'F6362': '등골근반사', 'F6363': '등골근반사소실'}
+# 순음 · 어음 · 음장 청력검사 코드 (MRS Resonance 청력검사기에서 받는 검사, 2026-11-27)
+HEARING_CODES = ('F6341', 'F6340', 'F6300', 'F0341', 'F0342', 'F0343', 'F0344')
+HEARING_NAMES = {'F6341': '순음청력(표준)', 'F6340': '순음청력(불쾌역치 포함)', 'F6300': '언어청각(어음)',
+                 'F0341': '음장역치', 'F0342': '음장역치(편측)', 'F0343': '음장어음', 'F0344': '음장어음(편측)'}
+ORDER_NAMES = {**TYMP_NAMES, **HEARING_NAMES}
 SA_RX = re.compile(r'anywhere|sybase|adaptive|\basa\b', re.I)       # 매직차트 DB(SQL Anywhere) ODBC 드라이버 이름
 LIMIT = 30                                                          # 예진이와 같게: 차트번호 5명, 나머지 30명
 
@@ -224,7 +229,7 @@ class MagicDb:
         out = []
         for ec, v in visits.items():
             p = dict(pats.get(v['code']) or dict(chart='', code=v['code'], name='(환자 정보 없음)', birth='', age=None, sex='', how='오늘 오더'))
-            p.update(time=v['time'], room=v['room'], codes=v['codes'], tests=' · '.join(TYMP_NAMES.get(c, c) for c in v['codes']), visit=ec)
+            p.update(time=v['time'], room=v['room'], codes=v['codes'], tests=' · '.join(ORDER_NAMES.get(c, c) for c in v['codes']), visit=ec)
             out.append(p)
         out.sort(key=lambda p: p['time'])
         return out
@@ -307,16 +312,20 @@ class YejinServer:
         return hit[0] if hit else None
 
     def todays_orders(self, order_codes=TYMP_CODES, day=None):
-        """그날 중이검사 오더가 난 진료 → MagicDb.todays_orders 와 같은 모양. 어떤 코드를 볼지는 서버가 정함(F6361~F6363)."""
+        """그날 중이검사 오더가 난 진료 → MagicDb.todays_orders 와 같은 모양. 어떤 코드를 볼지는 서버가 정함(지금은 F6361~F6363).
+        서버가 더 많은 코드를 보내 와도 order_codes 에 든 것이 하나도 없는 진료는 뺌(청력검사 코드 요청: docs/hearing/예진이_오더_요청.md)."""
         day = day or datetime.date.today().isoformat()
+        want = {str(c).strip().upper() for c in order_codes if str(c).strip()}
         out = []
         for o in self._get('/tsm/api/orders', {'day': day}).get('orders') or []:
             p = self._norm(o, '오늘 오더')
             if not p['chart']:
                 p['name'] = '(환자 정보 없음)'
             codes = [str(c).strip().upper() for c in o.get('codes') or [] if str(c).strip()]
+            if codes and not want & set(codes):
+                continue
             p.update(time=str(o.get('time') or '')[:5], room=str(o.get('room') or '').strip(), codes=codes,
-                     tests=' · '.join(TYMP_NAMES.get(c, c) for c in codes), visit=o.get('visit'))
+                     tests=' · '.join(ORDER_NAMES.get(c, c) for c in codes), visit=o.get('visit'))
             del p['last']
             out.append(p)
         out.sort(key=lambda p: p['time'])

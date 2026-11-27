@@ -15,15 +15,16 @@ from typing import Callable
 from . import links
 from .patient import Order, Patient, parse_birth_date
 from .settings import Settings
-from .store import EXAM_KIND, exam_of
+from .store import EXAM_KIND, HEARING, exam_of
 
 
 class Records:
     """Looks patients up through ``backend``, a ``links.MagicDb`` or ``links.YejinServer``."""
 
-    def __init__(self, backend, today: Callable[[], date] = date.today) -> None:
+    def __init__(self, backend, today: Callable[[], date] = date.today, codes: tuple[str, ...] = links.TYMP_CODES) -> None:
         self._backend = backend
         self._today = today
+        self._codes = tuple(codes)
         self._internal: dict[str, str] = {}
 
     def find(self, chart_no: str) -> Patient | None:
@@ -38,11 +39,12 @@ class Records:
 
     def todays_orders(self) -> list[Order]:
         try:
-            rows = self._backend.todays_orders(links.TYMP_CODES, self._today().isoformat())
+            rows = self._backend.todays_orders(self._codes, self._today().isoformat())
         except Exception as error:
             raise RuntimeError(error_text(error)) from None
         return [
-            Order(self._patient(row), time=row.get("time") or "", label=row.get("tests") or "", room=row.get("room") or "")
+            Order(self._patient(row), time=row.get("time") or "", label=row.get("tests") or "", room=row.get("room") or "",
+                  codes=tuple(str(code) for code in row.get("codes") or ()))
             for row in rows
         ]
 
@@ -78,11 +80,25 @@ class Records:
 
 
 def records_from_settings(settings: Settings) -> Records | None:
+    codes = links.TYMP_CODES + (links.HEARING_CODES if settings.hearing_on else ())
     if settings.emr_via == "odbc":
-        return Records(links.MagicDb(settings.emr_dsn, settings.emr_uid, settings.emr_pwd))
+        return Records(links.MagicDb(settings.emr_dsn, settings.emr_uid, settings.emr_pwd), codes=codes)
     if settings.emr_via == "server":
-        return Records(links.YejinServer(settings.emr_server, settings.emr_token))
+        return Records(links.YejinServer(settings.emr_server, settings.emr_token), codes=codes)
     return None
+
+
+EXAM_NAMES = {EXAM_KIND: "중이", HEARING: "청력"}
+"""Short names of the kinds of test, for the order list."""
+
+
+def exams_of(codes) -> tuple[str, ...]:
+    """The kinds of test (``tymp``, ``hearing``) an order's codes ask for. An order whose codes are
+    not known is a tympanometry order, as every order was before hearing tests were added."""
+    wanted = {str(code).strip().upper() for code in codes}
+    kinds = tuple(kind for kind, known in ((EXAM_KIND, links.TYMP_CODES), (HEARING, links.HEARING_CODES))
+                  if wanted & set(known))
+    return kinds or (EXAM_KIND,)
 
 
 def to_patient(found: dict) -> Patient:
@@ -124,7 +140,7 @@ def send_sheet(sheet: Path, patient: Patient, tested_on: date, settings: Setting
     details = {"chart": patient.chart_no, "name": patient.name,
                "birth": patient.birth_date.isoformat() if patient.birth_date else ""}
     try:
-        reply = send(str(sheet), details, tested_on, EXAM_KIND, url=settings.cap_url, key=settings.cap_key)
+        reply = send(str(sheet), details, tested_on, exam_of_sheet(sheet), url=settings.cap_url, key=settings.cap_key)
         outcome = {"ok": True, "duplicate": bool(reply.get("duplicate")), "id": reply.get("id"),
                    "imageDataName": reply.get("imageDataName"), "chartId": str(reply.get("chartId") or "")}
         if internal_number and outcome["chartId"] and not _same_number(internal_number, outcome["chartId"]):
@@ -135,6 +151,14 @@ def send_sheet(sheet: Path, patient: Patient, tested_on: date, settings: Setting
     return outcome
 
 
+def exam_of_sheet(sheet: Path) -> str:
+    """The kind of test on a saved sheet, as 상쾌한캡처 is told it: ``tymp`` or ``hearing``."""
+    try:
+        return exam_of(json.loads(sheet.with_suffix(".json").read_text(encoding="utf-8")))
+    except (OSError, ValueError, AttributeError):
+        return EXAM_KIND
+
+
 def _same_number(one: str, other: str) -> bool:
     one, other = one.strip(), other.strip()
     if one.isdigit() and other.isdigit():
@@ -142,14 +166,19 @@ def _same_number(one: str, other: str) -> bool:
     return one == other
 
 
-def charts_tested_on(directory: Path, day: date) -> set[str]:
-    """Chart numbers with a tympanometry result received and tested on ``day``.
+def charts_tested_on(directory: Path, day: date, exam: str = EXAM_KIND) -> set[str]:
+    """Chart numbers with a result of the kind ``exam`` (tympanometry unless said) received and tested on ``day``."""
+    return tested_on(directory, day).get(exam, set())
+
+
+def tested_on(directory: Path, day: date) -> dict[str, set[str]]:
+    """For each kind of test, the chart numbers with a result received and tested on ``day``.
 
     Only the files received that day are read, to keep this quick in a folder of years of
     results. One of them whose test time was corrected to another day is left out: a test
     done yesterday and sent from the device's memory today is not today's test.
     """
-    charts = set()
+    charts: dict[str, set[str]] = {}
     for path in directory.glob(f"{day:%Y%m%d}_*.json"):
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
@@ -157,8 +186,8 @@ def charts_tested_on(directory: Path, day: date) -> set[str]:
             tested = str(record.get("tested_at") or record["received_at"])[:10]
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             continue
-        if chart and exam_of(record) == EXAM_KIND and tested == day.isoformat():
-            charts.add(chart)
+        if chart and tested == day.isoformat():
+            charts.setdefault(exam_of(record), set()).add(chart)
     return charts
 
 
