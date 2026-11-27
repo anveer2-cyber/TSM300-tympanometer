@@ -23,6 +23,8 @@ in docs/hearing/원자료_형식.md.
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 
@@ -55,6 +57,21 @@ KIND_NAMES = {
 }
 EAR_NAMES = {"R": "오른쪽", "L": "왼쪽"}
 TYPE_NAMES = {TONE: "순음", SPEECH: "어음", HIGH_FREQUENCY: "고주파 순음"}
+
+
+TINNITUS_ITEMS = ("pitch_hz", "loudness_db", "threshold_db", "masking_noise_db", "minimum_masking_db_hl",
+                  "residual_inhibition_s", "inhibition")
+"""The tinnitus tests, as the maker's Korean report lists them (TINNITUS GRAM): pitch matching,
+loudness matching, the hearing threshold at that pitch, the masking noise threshold, the
+minimum masking level, residual inhibition and its kind."""
+TINNITUS_NAMES = {
+    "pitch_hz": "이명 주파수 (Hz)", "loudness_db": "이명 크기 (dB)", "threshold_db": "청력역치 (dB)",
+    "masking_noise_db": "차폐 잡음 역치 (dB)", "minimum_masking_db_hl": "최소 차폐 크기 (dB HL)",
+    "residual_inhibition_s": "잔류 억제 (초)", "inhibition": "억제 특성",
+}
+TINNITUS_TEXT = 40
+"""The most characters a tinnitus value keeps."""
+_NUMBER = re.compile(r"(-?\d+(?:\.\d+)?)\s*(k(?:hz)?(?![a-z]))?", re.IGNORECASE)
 
 
 class MergeError(ValueError):
@@ -166,6 +183,63 @@ class Correction:
 
 
 @dataclass(frozen=True)
+class Tinnitus:
+    """The tinnitus tests, typed in by hand: the device's tinnitus test is not decoded (nor is it by
+    the maker's program, whose report has them typed in too). Each value is free text, as the clinic
+    writes it: ``1500``, ``28 dB``, ``85 dB (o)``, ``Mo51dB``, ``완전 억제``."""
+
+    entries: tuple[tuple[str, str, str], ...] = ()
+    """(ear, item, text) for every value given, in the order of the sheet."""
+
+    def __post_init__(self) -> None:
+        kept = {}
+        for ear, item, value in self.entries:
+            if ear not in EAR_NAMES or item not in TINNITUS_ITEMS:
+                raise ValueError(f"이명 값의 자리를 알 수 없습니다 ({ear} {item})")
+            cleaned = " ".join(str(value).split())[:TINNITUS_TEXT]
+            if cleaned:
+                kept[(ear, item)] = cleaned
+        ordered = sorted(kept.items(), key=lambda entry: (entry[0][0] != "R", TINNITUS_ITEMS.index(entry[0][1])))
+        object.__setattr__(self, "entries", tuple((ear, item, value) for (ear, item), value in ordered))
+
+    @classmethod
+    def of(cls, texts: dict) -> Tinnitus:
+        """From (ear, item) -> text."""
+        return cls(tuple((ear, item, value) for (ear, item), value in texts.items()))
+
+    def text(self, ear: str, item: str) -> str:
+        return next((value for e, i, value in self.entries if (e, i) == (ear, item)), "")
+
+    def __bool__(self) -> bool:
+        return bool(self.entries)
+
+
+TINNITUS_GRAPH_HZ = (100, 10000)
+TINNITUS_GRAPH_DB = (-10, 120)
+"""Where a tinnitus match can go on the audiogram; one outside it is only in the table."""
+
+
+@dataclass(frozen=True)
+class TinnitusPoint:
+    """Where the tinnitus match goes on an ear's audiogram."""
+
+    frequency: int | float
+    level: int | float
+    """dB HL."""
+    source: str
+    """``HL`` when the loudness was given in dB HL, ``SL`` when above the ear's threshold."""
+
+
+def tinnitus_value(text: str) -> int | float | None:
+    """The number in a tinnitus value as typed: the first one in it, ``1.5k`` read as 1500; None when there is none."""
+    found = _NUMBER.search(text or "")
+    if found is None:
+        return None
+    number = float(found.group(1)) * (1000 if found.group(2) else 1)
+    return int(number) if number == int(number) else number
+
+
+@dataclass(frozen=True)
 class HearingResult:
     parts: tuple[Part, ...] = ()
     corrections: tuple[Correction, ...] = ()
@@ -173,6 +247,8 @@ class HearingResult:
     one for each value, each saying what the device sent, none that changes nothing."""
     manual: bool = False
     """Typed in by hand, without the device: no parts, every value a correction."""
+    tinnitus: Tinnitus = Tinnitus()
+    """The tinnitus tests, always typed in by hand."""
     tone: dict = field(init=False, repr=False, compare=False)
     """(kind, ear) -> ``Placed`` for the pure tone curves, as the sheet shows them."""
     speech: dict = field(init=False, repr=False, compare=False)
@@ -185,6 +261,8 @@ class HearingResult:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "parts", tuple(self.parts))
+        if not isinstance(self.tinnitus, Tinnitus):
+            object.__setattr__(self, "tinnitus", Tinnitus.of(dict(self.tinnitus or {})))
         if not self.parts and not self.manual:
             raise MergeError("고른 검사가 없습니다.")
         if self.parts and self.manual:
@@ -245,7 +323,10 @@ class HearingResult:
             before = earlier.get(cell)
             kept = before is not None and _same(cell[0], before.value, value)
             corrections.append(Correction(*cell, value=value, at=before.at if kept else when))
-        return HearingResult(self.parts, tuple(corrections), self.manual)
+        return HearingResult(self.parts, tuple(corrections), self.manual, self.tinnitus)
+
+    def with_tinnitus(self, tinnitus: Tinnitus) -> HearingResult:
+        return HearingResult(self.parts, self.corrections, self.manual, tinnitus)
 
     def speech_numbers(self, kind: str, ear: str) -> tuple[int, ...]:
         """The numbers (from 1, in the order measured) of the points of a speech curve on the sheet."""
@@ -259,7 +340,38 @@ class HearingResult:
     @property
     def is_empty(self) -> bool:
         """Nothing at all on the sheet."""
-        return not (self.tone or self.speech or self.srt or self.high_frequency)
+        return not (self.tone or self.speech or self.srt or self.high_frequency or self.tinnitus)
+
+    @property
+    def has_tinnitus(self) -> bool:
+        return bool(self.tinnitus)
+
+    def tinnitus_point(self, ear: str) -> TinnitusPoint | None:
+        """The tinnitus match of an ear on its audiogram: at the pitch, as loud as matched in dB HL.
+
+        A loudness in dB SL is put above the ear's air conduction threshold at the pitch, read
+        between the two nearest frequencies measured when the pitch itself was not. A loudness
+        in dB SPL is not put on the audiogram: there is no conversion to trust. Nor is anything
+        that cannot be read, or that falls outside the graph. None then."""
+        frequency = tinnitus_value(self.tinnitus.text(ear, "pitch_hz"))
+        loudness_text = self.tinnitus.text(ear, "loudness_db")
+        loudness = tinnitus_value(loudness_text)
+        if frequency is None or loudness is None or not TINNITUS_GRAPH_HZ[0] <= frequency <= TINNITUS_GRAPH_HZ[1]:
+            return None
+        unit = loudness_text.upper().replace(" ", "")
+        if "SPL" in unit:
+            return None
+        source = "SL" if "SL" in unit else "HL"
+        level = loudness
+        if source == "SL":
+            threshold = _threshold_at(self.tone_curve("Ac", ear), frequency)
+            if threshold is None:
+                return None
+            level = round(threshold + loudness, 1)
+            level = int(level) if level == int(level) else level
+        if not TINNITUS_GRAPH_DB[0] <= level <= TINNITUS_GRAPH_DB[1]:
+            return None
+        return TinnitusPoint(frequency, level, source)
 
     # --- what it holds ---------------------------------------------------------------------
 
@@ -540,6 +652,7 @@ def record(result: HearingResult) -> dict:
         "high_frequency": ({"curves": [_tone_curve(placed, HIGH_FREQUENCY, corrected)
                                        for placed in _ordered(result.high_frequency)]}
                            if result.high_frequency else None),
+        "tinnitus": _tinnitus(result) if result.tinnitus else None,
         "corrections": [correction_to_dict(correction) for correction in result.corrections],
     }
 
@@ -557,8 +670,9 @@ def from_saved(raw: bytes, saved: dict) -> HearingResult:
     if not isinstance(entries, list):
         raise ValueError("손으로 고친 값을 읽지 못했습니다")
     corrections = tuple(correction_from_dict(entry) for entry in entries)
+    tinnitus = tinnitus_from_record(saved.get("tinnitus"))
     if manual:
-        return HearingResult((), corrections, manual=True)
+        return HearingResult((), corrections, manual=True, tinnitus=tinnitus)
     aided = {str(test.get("fingerprint")) for test in saved.get("tests") or [] if isinstance(test, dict)
              and test.get("aided")}
     decoder = p.StreamDecoder()
@@ -574,7 +688,7 @@ def from_saved(raw: bytes, saved: dict) -> HearingResult:
             parts.append(Part(event, current, fingerprint(event) in aided))
     if not parts:
         raise ValueError("청력검사 원본 자료에 검사가 없습니다")
-    return HearingResult(tuple(parts), corrections)
+    return HearingResult(tuple(parts), corrections, tinnitus=tinnitus)
 
 
 def device_birth_date(patient: p.DevicePatient | None) -> date | None:
@@ -680,6 +794,49 @@ def _average(value: Average) -> dict:
         "value": None if value.value is None else round(value.value, 4), "shown": value.shown,
         "text": value.text(), "at_least": value.at_least, "missing_hz": list(value.missing),
     }
+
+
+def _threshold_at(curve, frequency) -> float | None:
+    """An air conduction threshold at ``frequency``: measured there, or read on the log-frequency axis
+    between the nearest frequencies measured below and above it. Points without a response do not count."""
+    if curve is None:
+        return None
+    heard = sorted((point.frequency, point.level) for point in curve.points if not point.no_response)
+    for measured, level in heard:
+        if measured == frequency:
+            return float(level)
+    below = [(measured, level) for measured, level in heard if measured < frequency]
+    above = [(measured, level) for measured, level in heard if measured > frequency]
+    if not below or not above:
+        return None
+    (low, low_level), (high, high_level) = below[-1], above[0]
+    share = (math.log(frequency) - math.log(low)) / (math.log(high) - math.log(low))
+    return low_level + share * (high_level - low_level)
+
+
+def _tinnitus(result: HearingResult) -> dict:
+    """Per ear, every item: the text as typed and the number read from it; and the match on the audiogram."""
+    tinnitus = result.tinnitus
+    section = {}
+    for ear in EAR_NAMES:
+        entry = {item: {"text": tinnitus.text(ear, item), "value": tinnitus_value(tinnitus.text(ear, item))}
+                 for item in TINNITUS_ITEMS}
+        point = result.tinnitus_point(ear)
+        entry["plotted"] = (None if point is None else
+                            {"frequency_hz": point.frequency, "level_db_hl": point.level, "from": point.source})
+        section[ear] = entry
+    return section
+
+
+def tinnitus_from_record(saved) -> Tinnitus:
+    """Reads back ``_tinnitus``. Raises ValueError when it cannot be read."""
+    if saved is None:
+        return Tinnitus()
+    try:
+        return Tinnitus(tuple((ear, item, str(saved[ear][item]["text"] or ""))
+                              for ear in saved for item in TINNITUS_ITEMS if item in saved[ear]))
+    except (KeyError, TypeError, AttributeError, ValueError) as error:
+        raise ValueError(f"이명 값을 읽지 못했습니다 ({error})") from None
 
 
 def _speech_point(point: p.SpeechPoint) -> dict:

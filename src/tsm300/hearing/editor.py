@@ -3,7 +3,8 @@
 Pure tone (and soundfield, UCL, MCL) values sit in one table per ear: a row per curve with its
 masking row under it, a column per frequency, and the 6분법 average beside, worked out as the
 operator types. Speech values sit in a table per curve and ear, a row per point measured; the
-high frequencies, when the result has them, in tables like the pure tone ones.
+high frequencies, when the result has them, in tables like the pure tone ones. The tinnitus
+tests, which the device's data does not give, are typed as free text per ear.
 
 Nothing is changed until [저장], and then only through ``save``, which the main window gives.
 What the device sent is never changed: the result keeps the corrections beside it (``record``).
@@ -18,7 +19,7 @@ from typing import Callable
 from PySide6.QtCore import QDateTime, QEvent, QObject, Qt
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
-    QAbstractItemDelegate, QAbstractItemView, QCheckBox, QDateTimeEdit, QDialog, QDialogButtonBox, QFormLayout,
+    QAbstractItemDelegate, QAbstractItemView, QCheckBox, QComboBox, QDateTimeEdit, QDialog, QDialogButtonBox, QFormLayout,
     QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QPlainTextEdit, QScrollArea, QTableWidget,
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
@@ -29,7 +30,8 @@ from . import edits
 from .protocol import HF_FREQUENCIES, TONE_FREQUENCIES, ToneCurve
 from .pta import average
 from .record import (
-    AVERAGED, EAR_NAMES, HIGH_FREQUENCY, KIND_NAMES, SPEECH, SPEECH_POINTS, SRT, TONE, HearingResult,
+    AVERAGED, EAR_NAMES, HIGH_FREQUENCY, KIND_NAMES, SPEECH, SPEECH_POINTS, SRT, TINNITUS_ITEMS, TINNITUS_NAMES,
+    TINNITUS_TEXT, TONE, HearingResult, Tinnitus,
 )
 
 TONE_ROWS = ("Ac", "Bc", "Spkr", "SpkrA", "AcU", "AcM")
@@ -51,6 +53,10 @@ HOW_TO = ("칸을 누르고 dB 값을 칩니다. Tab 이나 Enter 로 옆 칸으
 SPEECH_HOW_TO = ("점마다 강도, 정답률, 차폐, 맞힌 단어 수와 단어 수를 넣습니다. 쓰지 않는 칸은 비워 둡니다.\n"
                  "정답률을 비우고 단어 수를 넣으면 정답률은 맞힌 수 ÷ 단어 수로 채웁니다. "
                  "결과지에는 정답률이 가장 높은 점이 나옵니다.")
+TINNITUS_HOW_TO = ("이명도검사 값을 적힌 그대로 넣습니다 (예: 1500, 28 dB, 85 dB (o)). 칸마다 아무 글이나 됩니다.\n"
+                   "이명 주파수와 이명 크기를 넣으면 청력도에 T 로 표시합니다. 크기는 dB HL 로 읽고, "
+                   "10 dB SL 처럼 SL 이면 그 주파수의 기도 역치에 더합니다. SPL 이면 표에만 나옵니다.")
+INHIBITION_CHOICES = ("", "완전 억제", "부분 억제", "억제 없음", "반동")
 NOT_SAVED = "고친 값을 저장하지 않고 닫을까요?"
 
 
@@ -396,6 +402,7 @@ class HearingEditor(QDialog):
             self.high_frequency_grids = {ear: ToneGrid(HIGH_FREQUENCY, ear, HIGH_FREQUENCY_ROWS, HF_FREQUENCIES, False)
                                          for ear, _, _ in EARS}
             self.tabs.addTab(self._ear_page(self.high_frequency_grids, HOW_TO.split("\n")[0]), "고주파")
+        self.tabs.addTab(self._tinnitus_page(), "이명 •" if self.result.tinnitus else "이명")
         self.tabs.addTab(self._details_page(latest or now()), "검사일시 · 메모")
         for grid in self._grids():
             grid.fill(cells)
@@ -459,6 +466,51 @@ class HearingEditor(QDialog):
         layout.addStretch(1)
         return page
 
+    def _tinnitus_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(_note(TINNITUS_HOW_TO))
+        grid = QGridLayout()
+        for column, (_, name, color) in enumerate(EARS, start=1):
+            heading = QLabel(name)
+            heading.setStyleSheet(f"font-weight: 700; font-size: 14px; color: {color};")
+            grid.addWidget(heading, 0, column)
+        self.tinnitus_fields: dict[tuple[str, str], QWidget] = {}
+        for row, item in enumerate(TINNITUS_ITEMS, start=1):
+            grid.addWidget(QLabel(TINNITUS_NAMES[item]), row, 0)
+            for column, (ear, _, _) in enumerate(EARS, start=1):
+                if item == "inhibition":
+                    field = QComboBox()
+                    field.setEditable(True)
+                    field.addItems(list(INHIBITION_CHOICES))
+                    field.lineEdit().setMaxLength(TINNITUS_TEXT)
+                    field.installEventFilter(self._no_wheel)
+                else:
+                    field = QLineEdit()
+                    field.setMaxLength(TINNITUS_TEXT)
+                field.setMinimumWidth(220)
+                self.tinnitus_fields[(ear, item)] = field
+                self.set_tinnitus(ear, item, self.result.tinnitus.text(ear, item))
+                grid.addWidget(field, row, column)
+        grid.setColumnStretch(3, 1)
+        layout.addLayout(grid)
+        layout.addStretch(1)
+        self._tinnitus = self.tinnitus()
+        return page
+
+    def set_tinnitus(self, ear: str, item: str, text: str) -> None:
+        """Puts a tinnitus value in its box, as the operator would type it."""
+        field = self.tinnitus_fields[(ear, item)]
+        if isinstance(field, QComboBox):
+            field.setEditText(text)
+        else:
+            field.setText(text)
+
+    def tinnitus(self) -> Tinnitus:
+        """The tinnitus values in their boxes."""
+        return Tinnitus.of({key: field.currentText() if isinstance(field, QComboBox) else field.text()
+                            for key, field in self.tinnitus_fields.items()})
+
     def _details_page(self, latest: datetime) -> QWidget:
         page = QWidget()
         form = QFormLayout(page)
@@ -498,6 +550,7 @@ class HearingEditor(QDialog):
 
     def changed(self) -> bool:
         return (any(grid.changed() for grid in self._grids()) or self._note_text() != self._note
+                or self.tinnitus() != self._tinnitus
                 or self.remarks_edit.toPlainText().strip() != self._remarks or self._tested() != self._tested_at)
 
     def collect(self) -> tuple[dict, list[Problem]]:
@@ -514,7 +567,7 @@ class HearingEditor(QDialog):
         if problems:
             self._show_problems(problems)
             return
-        result = self.result.with_cells(changes, self._now())
+        result = self.result.with_cells(changes, self._now()).with_tinnitus(self.tinnitus())
         if result.is_empty:
             self.problem_label.setText("결과지에 넣을 값이 없습니다. 값을 하나 이상 넣으세요.")
             self.problem_label.setVisible(True)

@@ -53,7 +53,8 @@ def test_the_settings_decide_which_codes_are_asked_for():
 def test_orders_whose_codes_are_unknown_count_as_tympanometry():
     assert exams_of(()) == ("tymp",)
     assert exams_of(["f6341 "]) == ("hearing",)
-    assert EXAM_NAMES == {"tymp": "중이", "hearing": "청력"}
+    assert EXAM_NAMES == {"tymp": "중이", "hearing": "청력", "tinnitus": "이명"}
+    assert exams_of(["F6346"]) == ("tinnitus",)
 
 
 def test_the_relay_servers_orders_are_kept_to_the_codes_asked_for():

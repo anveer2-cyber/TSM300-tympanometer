@@ -11,9 +11,14 @@ that the two look like one set. The audiograms use the symbols of ASHA (1990):
     음장      S             S      (보청기 착용: A)
     불쾌역치   U             U      쾌적역치 M
     무반응    기호 아래로 화살표
+    이명      T             T      (이명 주파수 · 크기, 손으로 넣은 이명도검사에서)
+
+ASHA gives sound-field thresholds S and no symbol for aided ones, so a sheet must say what its
+own symbols mean: a legend under the tables names those drawn on it, and only those.
 
 Below them, a table per ear gives every threshold with its masking, and the 6분법 average as
-the clinic's former program printed it: decimals dropped (see ``pta``). Positions are
+the clinic's former program printed it: decimals dropped (see ``pta``). The tinnitus tests,
+typed in by hand, get a table of their own when any of them is filled in. Positions are
 millimetres from the top-left corner of the page.
 """
 
@@ -30,10 +35,10 @@ from ..patient import Patient
 from ..report import (
     _KOREAN, AXIS, COLUMN_WIDTH, DPI, GRIDLINE, INK, INK_SECONDARY, LEFT_COLUMN, LEFT_EAR, MARGIN, NOTE_TOP,
     PAGE_WIDTH, PIXELS, RIGHT_COLUMN, RIGHT_EAR, ROW_RULE, SURFACE, _axes, _draw_footer, _draw_note, _draw_patient,
-    _font_and_labels, _line, _printable, _rule, _text, _text_width, fitted,
+    _font_and_labels, _line, _printable, _rule, _text, _text_width, fitted, fitted_lines,
 )
 from .protocol import HF_FREQUENCIES
-from .record import AVERAGED, HearingResult, Placed
+from .record import AVERAGED, TINNITUS_ITEMS, HearingResult, Placed
 
 SOUNDFIELD = "#3a3a3a"
 NORMAL_BAND = "#f3f6f1"
@@ -59,6 +64,8 @@ LAYOUTS = (
     {"audiogram": 64.0, "row": 4.8, "mask": 3.8, "speech_row": 5.0, "gap": 5.0},
     {"audiogram": 56.0, "row": 4.4, "mask": 3.4, "speech_row": 4.6, "gap": 4.0},
     {"audiogram": 50.0, "row": 4.0, "mask": 3.0, "speech_row": 4.2, "gap": 3.0},
+    {"audiogram": 45.0, "row": 3.6, "mask": 2.8, "speech_row": 3.8, "gap": 2.5},
+    {"audiogram": 41.0, "row": 3.3, "mask": 2.6, "speech_row": 3.5, "gap": 2.0},
 )
 
 _KO = {
@@ -72,6 +79,13 @@ _KO = {
     "speech_rows": ("SRT (dB HL)", "최고 명료도 (%)", "그때 강도 (dB HL)", "정답 / 단어", "차폐 (dB HL)"),
     "high_frequency_title": "고주파 청력 (dB HL)",
     "device": "장비 MRS Resonance {serials}",
+    "tinnitus": "이명도검사",
+    "tinnitus_items": (("이명 주파수", "(Hz)"), ("이명 크기", "(dB)"), ("청력역치", "(dB)"), ("차폐 잡음 역치", "(dB)"),
+                       ("최소 차폐 크기", "(dB HL)"), ("잔류 억제", "(초)"), ("억제 특성", "")),
+    "legend": "기호:",
+    "symbols": {("Ac", False): "기도", ("Ac", True): "기도 차폐", ("Bc", False): "골도", ("Bc", True): "골도 차폐",
+                "Spkr": "음장(보청기 없이)", "SpkrA": "음장(보청기 착용)", "AcU": "불쾌역치", "AcM": "쾌적역치",
+                "T": "이명 (주파수 · 크기)", "silent": "무반응"},
 }
 _EN = {
     "tone": "Pure tone audiometry", "soundfield": "Soundfield", "speech": "Speech audiometry",
@@ -84,6 +98,13 @@ _EN = {
     "speech_rows": ("SRT (dB HL)", "Best score (%)", "At (dB HL)", "Correct / words", "Masking (dB HL)"),
     "high_frequency_title": "High frequencies (dB HL)",
     "device": "Device MRS Resonance {serials}",
+    "tinnitus": "Tinnitus",
+    "tinnitus_items": (("Pitch", "(Hz)"), ("Loudness", "(dB)"), ("Threshold", "(dB)"), ("Masking noise", "(dB)"),
+                       ("Min. masking", "(dB HL)"), ("Residual inh.", "(s)"), ("Inhibition", "")),
+    "legend": "Symbols:",
+    "symbols": {("Ac", False): "air", ("Ac", True): "air masked", ("Bc", False): "bone", ("Bc", True): "bone masked",
+                "Spkr": "soundfield (unaided)", "SpkrA": "soundfield (aided)", "AcU": "UCL", "AcM": "MCL",
+                "T": "tinnitus (pitch · loudness)", "silent": "no response"},
 }
 
 
@@ -118,6 +139,8 @@ def title(result: HearingResult, labels: dict = _KO) -> str:
         parts.append(labels["speech"])
     if result.has_high_frequency:
         parts.append(labels["high_frequency"])
+    if result.has_tinnitus:
+        parts.append(labels["tinnitus"])
     return " · ".join(parts) or labels["hearing"]
 
 
@@ -137,13 +160,22 @@ def _draw_header(figure: Figure, page: dict, clinic: Clinic, tested_at: datetime
 def _draw_results(figure: Figure, labels: dict, page: dict, result: HearingResult, layout: dict) -> float:
     """Draws the audiograms and tables, and returns where they end."""
     y = 57.0
-    if result.tone:
-        y = _audiograms(figure, page, result, y, layout["audiogram"])
-        y = _threshold_tables(figure, labels, result, y + 3, layout)
+    marks = {ear: result.tinnitus_point(ear) for ear in ("R", "L")}
+    marks = {ear: point for ear, point in marks.items() if point is not None}
+    if result.tone or marks:  # a tinnitus match alone is drawn on empty audiograms
+        y = _audiograms(figure, page, result, y, layout["audiogram"], marks)
+        if result.tone:
+            y = _threshold_tables(figure, labels, result, y + 3, layout)
+        lines, size = fitted_lines(legend(result, marks, labels), 6.5, PAGE_WIDTH - 2 * MARGIN, smallest=5.5)
+        for line in lines:
+            _text(figure, MARGIN, y + 2.6, line, size=size, color=INK_SECONDARY)
+            y += 3.2
     if result.speech or result.srt:
         y = _speech_table(figure, labels, page, result, y + layout["gap"], layout)
     if result.high_frequency:
         y = _high_frequency_tables(figure, labels, page, result, y + layout["gap"], layout)
+    if result.tinnitus:
+        y = _tinnitus_table(figure, labels, page, result, y + layout["gap"], layout)
     return y
 
 
@@ -160,7 +192,8 @@ def _frequency_label(frequency: int) -> str:
 
 # --- audiograms ---------------------------------------------------------------------------------
 
-def _audiograms(figure: Figure, page: dict, result: HearingResult, top: float, height: float) -> float:
+def _audiograms(figure: Figure, page: dict, result: HearingResult, top: float, height: float,
+                marks: dict | None = None) -> float:
     for x, ear, name, color in _columns(page):
         _line(figure, x, x + 6, top + 3.7, color=color, width=2.4)
         _text(figure, x + 8.5, top + 5, name, size=12, weight="bold")
@@ -170,7 +203,47 @@ def _audiograms(figure: Figure, page: dict, result: HearingResult, top: float, h
         for placed in sorted(result.tone.values(), key=lambda placed: _row_rank(placed.kind)):
             if placed.ear == ear:
                 _plot_curve(axes, placed, color)
+        if marks and ear in marks:
+            _plot_tinnitus(axes, marks[ear], color)
     return top + height
+
+
+# What each symbol on the audiograms stands for, in the order the legend gives them. Ac and Bc have
+# one symbol per ear, unmasked and masked; the letters are the same on both ears.
+_LEGEND = (
+    (("Ac", False), "O", "X"), (("Ac", True), "△", "□"), (("Bc", False), "<", ">"), (("Bc", True), "[", "]"),
+    ("Spkr", "S", "S"), ("SpkrA", "A", "A"), ("AcU", "U", "U"), ("AcM", "M", "M"),
+)
+
+
+def legend(result: HearingResult, marks: dict, labels: dict = _KO) -> str:
+    """The symbols drawn on this sheet's audiograms and what they stand for; "" when none is drawn."""
+    drawn: set = set()
+    silent = False
+    for placed in result.tone.values():
+        for point in placed.curve.points:
+            if point.frequency > 8000:
+                continue
+            key = (placed.kind, point.masked) if placed.kind in ("Ac", "Bc") else placed.kind
+            drawn.add((key, placed.ear))
+            silent = silent or point.no_response
+    entries = []
+    for key, right, left in _LEGEND:
+        ears = [glyph for ear, glyph in (("R", right), ("L", left)) if (key, ear) in drawn]
+        if ears:
+            entries.append(f"{'·'.join(dict.fromkeys(ears))} {labels['symbols'][key]}")
+    if marks:
+        entries.append(f"T {labels['symbols']['T']}")
+    if silent:
+        entries.append(f"↓ {labels['symbols']['silent']}")
+    return f"{labels['legend']} " + "  ·  ".join(entries) if entries else ""
+
+
+def _plot_tinnitus(axes, point, color: str) -> None:
+    """The tinnitus match, a bold T in the ear's colour, placed as the soundfield letters are."""
+    axes.text(point.frequency, point.level, "T", color=color, fontsize=12.5, fontweight="bold", ha="center",
+              va="center", zorder=4, clip_on=False,
+              bbox={"boxstyle": "square,pad=0.05", "facecolor": SURFACE, "edgecolor": "none"})
 
 
 def _audiogram_axes(axes) -> None:
@@ -377,3 +450,27 @@ def _high_frequency_tables(figure: Figure, labels: dict, page: dict, result: Hea
     kinds = _row_kinds(result.high_frequency)
     return _ear_tables(figure, labels, result.high_frequency, kinds, HF_FREQUENCIES, top + 5, layout,
                        with_average=False)
+
+
+def _tinnitus_table(figure: Figure, labels: dict, page: dict, result: HearingResult, top: float,
+                    layout: dict) -> float:
+    """The tinnitus tests as typed, a row per ear and a column per test."""
+    _text(figure, MARGIN, top + 4, labels["tinnitus"], size=11, weight="bold")
+    label_width = 26.0
+    cell = (PAGE_WIDTH - 2 * MARGIN - label_width) / len(TINNITUS_ITEMS)
+    y = top + 10
+    for index, (name, unit) in enumerate(labels["tinnitus_items"]):
+        x = MARGIN + label_width + (index + 0.5) * cell
+        _cell(figure, x, y, name, cell, 7.5, color=INK_SECONDARY)
+        if unit:
+            _cell(figure, x, y + 3.2, unit, cell, 6.5, color=INK_SECONDARY)
+    y += 3.2
+    _rule(figure, y + 1.5, MARGIN, PAGE_WIDTH - MARGIN, color=INK_SECONDARY, width=0.6)
+    for _, ear, name, color in _columns(page):
+        y += layout["speech_row"]
+        label, size = fitted(name, 7.5, label_width - 1, "bold", smallest=6)
+        _text(figure, MARGIN, y, label, size=size, weight="bold", color=color)
+        for index, item in enumerate(TINNITUS_ITEMS):
+            _cell(figure, MARGIN + label_width + (index + 0.5) * cell, y, result.tinnitus.text(ear, item), cell, 8.5)
+        _rule(figure, y + 1.6, MARGIN, PAGE_WIDTH - MARGIN, color=ROW_RULE)
+    return y + 2

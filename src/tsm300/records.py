@@ -88,15 +88,20 @@ def records_from_settings(settings: Settings) -> Records | None:
     return None
 
 
-EXAM_NAMES = {EXAM_KIND: "중이", HEARING: "청력"}
+TINNITUS = "tinnitus"
+"""Not a kind of result of its own: the tinnitus tests go on a hearing result. In the order list
+they are marked apart, done once a hearing result of the day has them."""
+EXAM_NAMES = {EXAM_KIND: "중이", HEARING: "청력", TINNITUS: "이명"}
 """Short names of the kinds of test, for the order list."""
 
 
 def exams_of(codes) -> tuple[str, ...]:
-    """The kinds of test (``tymp``, ``hearing``) an order's codes ask for. An order whose codes are
-    not known is a tympanometry order, as every order was before hearing tests were added."""
+    """The kinds of test (``tymp``, ``hearing``, ``tinnitus``) an order's codes ask for. An order whose
+    codes are not known is a tympanometry order, as every order was before hearing tests were added."""
     wanted = {str(code).strip().upper() for code in codes}
-    kinds = tuple(kind for kind, known in ((EXAM_KIND, links.TYMP_CODES), (HEARING, links.HEARING_CODES))
+    hearing = tuple(code for code in links.HEARING_CODES if code not in links.TINNITUS_CODES)
+    kinds = tuple(kind for kind, known in ((EXAM_KIND, links.TYMP_CODES), (HEARING, hearing),
+                                           (TINNITUS, links.TINNITUS_CODES))
                   if wanted & set(known))
     return kinds or (EXAM_KIND,)
 
@@ -188,6 +193,8 @@ def tested_on(directory: Path, day: date) -> dict[str, set[str]]:
             continue
         if chart and tested == day.isoformat():
             charts.setdefault(exam_of(record), set()).add(chart)
+            if exam_of(record) == HEARING and record.get("tinnitus"):
+                charts.setdefault(TINNITUS, set()).add(chart)
     return charts
 
 
