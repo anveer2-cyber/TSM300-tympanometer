@@ -1,4 +1,5 @@
-"""Command line: the operator's window (the default), updating, a desktop shortcut, console listening, raw capture, ports, decoding."""
+"""Command line: the operator's window (the default), updating, a desktop shortcut, console listening, raw capture,
+ports, decoding, and the audiometer's check and sample sheet."""
 
 from __future__ import annotations
 
@@ -53,6 +54,20 @@ def build_parser() -> argparse.ArgumentParser:
     decode.add_argument("--birth", default="", help="생년월일 (예: 1980-01-31)")
     decode.add_argument("--note", default="", help="결과지에 인쇄할 메모")
     decode.add_argument("--tested", default="", help="결과지에 인쇄할 검사일시 (예: \"2026-11-26 14:30\"). 생략하면 지금")
+
+    hearing_check = commands.add_parser(
+        "hearing-check", help="청력검사기(MRS Resonance)를 USB 로 찾아 저장된 검사를 읽어 보고, 주고받은 바이트를 모두 기록합니다 (읽기만)")
+    hearing_check.add_argument("--simulator", action="store_true", help="실제 기기 대신 모의 장비로 해 봅니다")
+    hearing_check.add_argument("--out", default="", help="바이트 기록을 둘 폴더 (기본: 저장 폴더 안의 청력검사기_기록)")
+
+    hearing_demo = commands.add_parser("hearing-demo", help="모의 장비의 견본 검사로 청력검사 결과지를 그려 봅니다")
+    hearing_demo.add_argument("file", nargs="?", default="청력검사_견본.jpg", help="그릴 파일 (.jpg 또는 .png)")
+    hearing_demo.add_argument("--chart", default="", help="차트번호 (생략하면 견본 환자)")
+    hearing_demo.add_argument("--name", default="", help="환자 이름")
+    hearing_demo.add_argument("--sex", default="", help="성별 (남 또는 여)")
+    hearing_demo.add_argument("--birth", default="", help="생년월일 (예: 1980-01-31)")
+    hearing_demo.add_argument("--note", default=None, help="결과지에 인쇄할 메모 (생략하면 견본이라는 안내)")
+    hearing_demo.add_argument("--tested", default="", help="검사일시 (예: \"2026-11-27 10:30\"). 생략하면 지금")
     return parser
 
 
@@ -102,6 +117,18 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(str(error))
         return listen.decode_files(args.files, Path(args.out), console, patient, args.note,
                                    clinic=settings_file.load().clinic, tested_at=tested_at)
+    if args.command == "hearing-check":
+        from .hearing import commands
+        return commands.check(args, console)
+    if args.command == "hearing-demo":
+        from .hearing import commands
+        try:
+            patient = Patient(args.chart, args.name, parse_sex(args.sex), parse_birth_date(args.birth))
+            args.tested = parse_moment(args.tested)
+        except ValueError as error:
+            parser.error(str(error))
+        args.patient = None if patient.is_empty else patient
+        return commands.demo(args, console)
     from . import app
     return app.run(args)
 

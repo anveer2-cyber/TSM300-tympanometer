@@ -1,5 +1,5 @@
 # Tries dist\TSM300.exe the way a PC without Python runs it: its version, a real result
-# decoded and drawn, the window opening, and the program replacing itself with the newest
+# decoded and drawn, the audiometer's sheet and simulated reading, the window opening, and the program replacing itself with the newest
 # published release. Run from the repository folder after tools/build_exe.py; the last part
 # needs the internet. Stops with an error at the first thing that does not work.
 $ErrorActionPreference = "Stop"
@@ -55,6 +55,23 @@ Run-Program $exe @("decode", "tests\data\both_ears.bin", "--out", $results, "--c
 $sheet = Get-ChildItem $results -Filter *.jpg | Select-Object -First 1
 if (-not $sheet -or $sheet.Length -lt 100000) { throw "no result sheet was drawn" }
 
+# --- the audiometer: a sample sheet, the whole reading of the simulated device with its byte log,
+# and Windows' USB device list read through winusb (no audiometer on this PC, so it ends with 1)
+$demo = Join-Path $work "hearing.jpg"
+Run-Program $exe @("hearing-demo", $demo) "hearing-demo" | Out-Null
+if (-not (Test-Path $demo) -or (Get-Item $demo).Length -lt 100000) { throw "no hearing sheet was drawn" }
+$hearingLog = Join-Path $work "hearing-log"
+$said = Run-Program $exe @("hearing-check", "--simulator", "--out", $hearingLog) "hearing-check"
+if ($said -notmatch "R37A21C000777") { throw "the simulated audiometer was not read: $said" }
+if (-not (Get-ChildItem $hearingLog -Filter *.txt)) { throw "no byte log of the audiometer was written" }
+$usbOut = Join-Path $work "hearing-usb.out"
+$process = Start-Process $exe -ArgumentList @("hearing-check") -PassThru -NoNewWindow `
+    -RedirectStandardOutput $usbOut -RedirectStandardError (Join-Path $work "hearing-usb.err")
+$null = $process.Handle
+$process.WaitForExit()
+$said = [string](Get-Content $usbOut -Raw -Encoding utf8)
+if ($said -notmatch "CF6C4074") { throw "the USB device list could not be read: $said" }
+
 # --- the window
 Start-Process $exe | Out-Null
 Wait-ForWindow "TSM-300*v$version"
@@ -73,4 +90,4 @@ $said = (Run-Program $copy @("--version") "updated").Trim()
 if ($said -ne $published) { throw "after updating the program says '$said', the published version is '$published'" }
 
 $size = [math]::Round((Get-Item $exe).Length / 1MB)
-Write-Output "TSM300.exe v$version ($size MB): version, result sheet, window and self-update (to v$published) all work"
+Write-Output "TSM300.exe v$version ($size MB): version, result sheet, audiometer, window and self-update (to v$published) all work"

@@ -6,7 +6,8 @@ Run on Windows, from the repository folder:
     python tools/build_exe.py
 
 The program is built without a console window. ``--collect-data`` takes the icon from the
-installed package, which is why the package is installed first.
+installed package, which is why the package is installed first. The audiometer's USB link uses
+Windows' own winusb.dll and setupapi.dll through ctypes, so nothing more has to be bundled for it.
 """
 
 from pathlib import Path
@@ -24,6 +25,8 @@ PyInstaller.__main__.run([
     "--clean",
     "--icon", str(ROOT / "src" / "tsm300" / "assets" / "tsm300.ico"),
     "--collect-data", "tsm300",
+    # Every part of the program, the audiometer's included: some are only imported when a command needs them.
+    "--collect-submodules", "tsm300",
     # Optional extras of the drawing library that this program never touches. They only
     # get in when they happen to be installed on the building PC, and they are large.
     "--exclude-module", "tkinter",
