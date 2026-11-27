@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from typing import Callable
 
@@ -33,7 +34,12 @@ def open_port(port: str, baud: int):
 
 
 def available_ports() -> list:
-    return sorted(list_ports.comports(), key=lambda p: p.device)
+    """The PC's serial ports in the order a person counts them: COM3 before COM10."""
+    return sorted(list_ports.comports(), key=lambda port: _natural(port.device))
+
+
+def _natural(name: str) -> list:
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name)]
 
 
 def choose_port(console: Console) -> tuple[str | None, dict]:

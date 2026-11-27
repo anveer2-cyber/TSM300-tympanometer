@@ -18,7 +18,8 @@ jobs:
         with:
           python-version: "3.12"
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+        # fonts-nanum: with a Korean font the sheet is drawn with its Korean labels, as on the clinic's PCs
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1 fonts-nanum
       - run: python -m pip install ".[dev]"
       - run: python -m pytest -rs
       - run: python -m tsm300 ports

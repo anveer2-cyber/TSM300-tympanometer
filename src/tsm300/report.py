@@ -17,12 +17,11 @@ from matplotlib.patches import Rectangle
 from matplotlib.textpath import TextToPath
 
 from . import __version__
+from .clinic import Clinic
 from .patient import Patient
 from .protocol import (
     REFLEX_FREQUENCIES, REFLEX_POINTS, EarResult, Measurement, tympanogram_pressures,
 )
-
-CLINIC_NAME = "상쾌한이비인후과"
 
 PAGE_WIDTH, PAGE_HEIGHT = 210.0, 297.0
 DPI = 300
@@ -93,6 +92,7 @@ _KOREAN = {
     "not_measured": "측정 없음",
     "no_reflex": "반사 검사 없음",
     "device": "장비 {name} · 메모리 ID {memory_id}",
+    "phone": "전화 {phone}",
 }
 _ENGLISH = {
     "title": "Tympanometry",
@@ -124,6 +124,7 @@ _ENGLISH = {
     "not_measured": "Not measured",
     "no_reflex": "No reflex test",
     "device": "Device {name} · memory ID {memory_id}",
+    "phone": "Tel. {phone}",
 }
 _SEX_IN_ENGLISH = {"남": "M", "여": "F"}
 
@@ -183,33 +184,82 @@ def _character_width(character: str) -> float:
     return TextToPath().get_text_width_height_descent(character, properties, False)[0]
 
 
-def render(measurement: Measurement, path: Path, received_at: datetime,
-           patient: Patient = Patient(), note: str = "", clinic: str = CLINIC_NAME) -> None:
+def fitted(text: str, size: float, room: float, weight: str = "normal", smallest: float | None = None) -> tuple[str, float]:
+    """The text and the type size at which it fits in ``room`` millimetres.
+
+    Type is made smaller first, down to ``smallest`` points; text that is still too long is
+    cut and ends in an ellipsis. Whatever a clinic or a patient is called, nothing on the
+    sheet may run into what is printed beside it.
+    """
+    text = " ".join(text.split())
+    if not text:
+        return "", size
+    smallest = size if smallest is None else smallest
+    while size > smallest and _text_width(text, size, weight) > room:
+        size = max(smallest, size - 0.5)
+    if _text_width(text, size, weight) <= room:
+        return text, size
+    while text and _text_width(text + "…", size, weight) > room:
+        text = text[:-1]
+    return text.rstrip() + "…", size
+
+
+def fitted_lines(text: str, size: float, room: float, weight: str = "normal",
+                 smallest: float | None = None) -> tuple[list[str], float]:
+    """Like ``fitted``, but text too long even in the smallest type goes onto a second line
+    before any of it is cut. A patient's name is printed whole wherever that is possible."""
+    whole = " ".join(text.split())
+    one, one_size = fitted(whole, size, room, weight, smallest)
+    if one == whole:
+        return [one], one_size
+    first = whole
+    while first and _text_width(first, one_size, weight) > room:
+        first = first[:-1]
+    if " " in first and whole[len(first)] != " ":
+        between_words = first[:first.rindex(" ")]
+        if _text_width(whole[len(between_words):].strip(), one_size, weight) <= room:
+            first = between_words  # only when the rest then fits: a cut name is worse than a split word
+    second, _ = fitted(whole[len(first):], one_size, room, weight)
+    return [first.rstrip(), second], one_size
+
+
+def _text_width(text: str, size: float, weight: str = "normal") -> float:
+    """The width of ``text`` on the sheet, in millimetres."""
+    fonts, _ = _font_and_labels()
+    properties = font_manager.FontProperties(family=fonts, size=size, weight=weight)
+    return TextToPath().get_text_width_height_descent(text, properties, False)[0] / POINTS_PER_MM
+
+
+def render(measurement: Measurement, path: Path, tested_at: datetime,
+           patient: Patient = Patient(), note: str = "", clinic: Clinic = Clinic()) -> None:
     """Writes the result sheet to ``path``; the file type follows its suffix (.jpg or .png)."""
     fonts, labels = _font_and_labels()
     with matplotlib.rc_context({"font.family": fonts, "axes.unicode_minus": False}):
         figure = Figure(figsize=(PIXELS[0] / DPI, PIXELS[1] / DPI), dpi=DPI, facecolor=SURFACE)
-        _draw_header(figure, labels, clinic if labels is _KOREAN else "", received_at)
-        _draw_patient(figure, labels, patient, received_at)
+        _draw_header(figure, labels, clinic, tested_at)
+        _draw_patient(figure, labels, patient, tested_at)
         _draw_tympanograms(figure, labels, measurement)
         _draw_reflexes(figure, labels, measurement)
-        _draw_values(figure, labels, measurement, patient.age_on(received_at.date()))
+        _draw_values(figure, labels, measurement, patient.age_on(tested_at.date()))
         _draw_note(figure, labels, note)
-        _draw_footer(figure, labels, measurement)
+        _draw_footer(figure, labels, measurement, clinic)
         options = {"quality": 95, "subsampling": 0} if Path(path).suffix.lower() in (".jpg", ".jpeg") else {}
         figure.savefig(path, dpi=DPI, pil_kwargs=options)
 
 
-def _draw_header(figure: Figure, labels: dict, clinic: str, received_at: datetime) -> None:
-    _text(figure, MARGIN, 17, clinic, size=10, color=INK_SECONDARY)
+def _draw_header(figure: Figure, labels: dict, clinic: Clinic, tested_at: datetime) -> None:
+    when = f"{tested_at:%Y-%m-%d %H:%M}"
+    room = PAGE_WIDTH - 2 * MARGIN - _text_width(when, 12, "bold") - 8
+    name, size = fitted(_printable(clinic.name, labels), 11, room, "bold", smallest=8)
+    _text(figure, MARGIN, 17, name, size=size, weight="bold")
     _text(figure, MARGIN, 25.5, labels["title"], size=18, weight="bold")
     _text(figure, PAGE_WIDTH - MARGIN, 17, labels["tested_at"], size=8.5, color=INK_SECONDARY, ha="right")
-    _text(figure, PAGE_WIDTH - MARGIN, 25.5, f"{received_at:%Y-%m-%d %H:%M}", size=12, weight="bold", ha="right")
+    _text(figure, PAGE_WIDTH - MARGIN, 25.5, when, size=12, weight="bold", ha="right")
     _rule(figure, 31.5, color=INK, width=0.8)
 
 
-def _draw_patient(figure: Figure, labels: dict, patient: Patient, received_at: datetime) -> None:
-    age = patient.age_on(received_at.date())
+def _draw_patient(figure: Figure, labels: dict, patient: Patient, tested_at: datetime) -> None:
+    age = patient.age_on(tested_at.date())
     sex = patient.sex if labels is _KOREAN else _SEX_IN_ENGLISH.get(patient.sex, "")
     sex_age = " / ".join(part for part in (sex, labels["age"].format(age=age) if age is not None else "") if part)
     fields = [
@@ -218,12 +268,16 @@ def _draw_patient(figure: Figure, labels: dict, patient: Patient, received_at: d
         (109.0, labels["sex_age"], sex_age),
         (156.0, labels["birth_date"], patient.birth_date.isoformat() if patient.birth_date else ""),
     ]
-    for x, label, value in fields:
+    edges = [x for x, _, _ in fields[1:]] + [PAGE_WIDTH - MARGIN]
+    for (x, label, value), next_x in zip(fields, edges):
         _text(figure, x, 38.5, label, size=8.5, color=INK_SECONDARY)
-        if value:
-            _text(figure, x, 46, value, size=13, weight="bold")
-        else:
+        if not value:
             _rule(figure, 48, x, x + 36)
+            continue
+        lines, size = fitted_lines(value, 13, next_x - x - 3, "bold", smallest=9)
+        baselines = (46.0,) if len(lines) == 1 else (44.3, 48.6)
+        for line, y in zip(lines, baselines):
+            _text(figure, x, y, line, size=size, weight="bold")
     _rule(figure, 52.5)
 
 
@@ -343,11 +397,23 @@ def _draw_note(figure: Figure, labels: dict, note: str) -> None:
         _text(figure, MARGIN + NOTE_PADDING, NOTE_TOP + 6.3 + index * 5.2, line, size=NOTE_FONT_SIZE)
 
 
-def _draw_footer(figure: Figure, labels: dict, measurement: Measurement) -> None:
+def _draw_footer(figure: Figure, labels: dict, measurement: Measurement, clinic: Clinic) -> None:
+    """The clinic's address and telephone on the left; the device and this program on the right."""
     _rule(figure, 279)
     device = labels["device"].format(name=measurement.device_name, memory_id=measurement.memory_id)
-    _text(figure, MARGIN, 284, device, size=8, color=INK_SECONDARY)
-    _text(figure, PAGE_WIDTH - MARGIN, 284, f"TSM300 v{__version__}", size=8, color=INK_SECONDARY, ha="right")
+    source = f"{device} · TSM300 v{__version__}"
+    _text(figure, PAGE_WIDTH - MARGIN, 284, source, size=8, color=INK_SECONDARY, ha="right")
+    address, phone = _printable(clinic.address, labels), _printable(clinic.phone, labels)
+    contact = " · ".join(part for part in (address, labels["phone"].format(phone=phone) if phone else "") if part)
+    if contact:
+        room = PAGE_WIDTH - 2 * MARGIN - _text_width(source, 8) - 8
+        contact, size = fitted(contact, 8, room, smallest=6.5)
+        _text(figure, MARGIN, 284, contact, size=size, color=INK_SECONDARY)
+
+
+def _printable(text: str, labels: dict) -> str:
+    """The clinic's own words, left out on a PC with no Korean font when they would print as empty boxes."""
+    return text if labels is _KOREAN or text.isascii() else ""
 
 
 def _columns(labels: dict, measurement: Measurement):

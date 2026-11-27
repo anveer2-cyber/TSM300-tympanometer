@@ -34,6 +34,12 @@ class Patient:
         """The chart number in a form that is safe inside a file name. Names are kept out of file names."""
         return _UNSAFE_IN_FILE_NAME.sub("", self.chart_no)
 
+    def filing_name(self) -> str:
+        """Chart number and name as the start of a file name in the tidy archive, where a
+        person looks a patient up by name. (The files saved on arrival carry no names.)"""
+        parts = (_UNSAFE_IN_FILE_NAME.sub("", self.chart_no), _UNSAFE_IN_FILE_NAME.sub("", self.name))
+        return "_".join(part for part in parts if part) or "환자정보없음"
+
     def to_dict(self) -> dict:
         return {
             "chart_no": self.chart_no,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from . import __version__
@@ -20,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=__version__)
     _add_port_options(parser)
-    parser.add_argument("--out", help="결과를 저장할 폴더 (기본: results, exe 는 설정 폴더 안의 results)")
+    parser.add_argument("--out", help="결과를 저장할 폴더 (기본: 설정에서 정한 폴더)")
     commands = parser.add_subparsers(dest="command", title="그 밖의 명령")
 
     listen = commands.add_parser("listen", help="창 없이 명령 프롬프트에서 결과를 받아 저장합니다")
@@ -51,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     decode.add_argument("--sex", default="", help="성별 (남 또는 여)")
     decode.add_argument("--birth", default="", help="생년월일 (예: 1980-01-31)")
     decode.add_argument("--note", default="", help="결과지에 인쇄할 메모")
+    decode.add_argument("--tested", default="", help="결과지에 인쇄할 검사일시 (예: \"2026-11-26 14:30\"). 생략하면 지금")
     return parser
 
 
@@ -80,7 +82,8 @@ def main(argv: list[str] | None = None) -> int:
             console.say(str(error))
             return 1
         console.say(f"바로가기를 만들었습니다: {created}")
-        console.say(f"바로가기로 실행하면 결과는 {settings_file.results_directory().resolve()} 에 저장됩니다.")
+        chosen = settings_file.load().results_dir
+        console.say(f"바로가기로 실행하면 결과는 {settings_file.results_directory(chosen).resolve()} 에 저장됩니다.")
         return 0
     if args.command == "update":
         return _update(args, console)
@@ -94,13 +97,26 @@ def main(argv: list[str] | None = None) -> int:
         from . import listen
         try:
             patient = Patient(args.chart, args.name, parse_sex(args.sex), parse_birth_date(args.birth))
+            tested_at = parse_moment(args.tested)
         except ValueError as error:
             parser.error(str(error))
-        return listen.decode_files(args.files, Path(args.out), console, patient, args.note)
+        return listen.decode_files(args.files, Path(args.out), console, patient, args.note,
+                                   clinic=settings_file.load().clinic, tested_at=tested_at)
     from . import app
-    if args.out is None:
-        args.out = str(settings_file.results_directory())
     return app.run(args)
+
+
+def parse_moment(text: str) -> datetime | None:
+    """Reads a date with or without a time, such as 2026-11-26 14:30. Returns None when ``text`` is blank."""
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    for layout in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(cleaned, layout)
+        except ValueError:
+            continue
+    raise ValueError(f"검사일시를 읽을 수 없습니다: {text!r} (예: 2026-11-26 14:30)")
 
 
 def _update(args, console: Console) -> int:

@@ -28,6 +28,10 @@ PROGRAM_NAME = "TSM300.exe"
 PYTHON_COMMAND = ("python -m pip install --upgrade "
                   "https://github.com/anveer2-cyber/TSM300-tympanometer/archive/refs/heads/claude/cool-hamilton-bdp178.zip")
 
+RESTARTED = "TSM300_RESTARTED"
+"""Set in the environment of a program started by ``restart``: the one that started it is
+still closing, so the new one waits for it rather than report that it is already running."""
+
 _TAG = re.compile(r"/releases/tag/(v?(\d+(?:\.\d+)*))/?$")
 _HEADERS = {"User-Agent": f"TSM300/{__version__}"}
 _CHUNK = 256 * 1024
@@ -110,7 +114,7 @@ def install(release: Release, program: Path, progress: Progress | None = None, r
 def restart(program: Path, arguments: list[str], start=subprocess.Popen) -> None:
     """Starts ``program`` afresh, apart from this process, which the caller then ends."""
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    start([str(program), *arguments], env=_fresh_environment(), close_fds=True, creationflags=flags,
+    start([str(program), *arguments], env=dict(_fresh_environment(), **{RESTARTED: "1"}), close_fds=True, creationflags=flags,
           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 

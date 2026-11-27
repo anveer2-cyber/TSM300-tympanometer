@@ -268,3 +268,204 @@ def test_result_saved_before_kinds_were_written_down_still_opens(tmp_path):
     record_file.write_text(json.dumps(record), encoding="utf-8")
 
     assert load_result(sheet).measurement == measurement
+
+
+# ----- what a saved result holds, and replacing one ------------------------------------------
+
+def files_in(folder):
+    return {path.name: path.read_bytes() for path in folder.iterdir() if path.is_file()}
+
+
+def test_saved_result_remembers_the_test_time_and_the_clinic(tmp_path):
+    from tsm300.clinic import Clinic
+    from tsm300.store import load_result, save_result
+
+    clinic = Clinic("바른이비인후과의원", "부산시 해운대구 가나로 12", "051-123-4567")
+    tested = datetime(2026, 11, 25, 14, 30)
+
+    as_received = load_result(save_result(parse_message(BOTH), tmp_path / "a", WHEN))
+    corrected = load_result(save_result(parse_message(BOTH), tmp_path / "b", WHEN, tested_at=tested, clinic=clinic))
+
+    assert (as_received.received_at, as_received.tested_at, as_received.clinic) == (WHEN, WHEN, Clinic())
+    assert (corrected.received_at, corrected.tested_at, corrected.clinic) == (WHEN, tested, clinic)
+    assert corrected.sheet.name == "20261126_211205.jpg"  # named after its arrival, whatever the test time
+
+
+def test_result_saved_before_test_times_were_kept_reads_the_time_it_arrived(tmp_path):
+    from tsm300.store import load_result, save_result
+
+    sheet = save_result(parse_message(BOTH), tmp_path, WHEN)
+    record_file = sheet.with_suffix(".json")
+    record = json.loads(record_file.read_text(encoding="utf-8"))
+    del record["tested_at"], record["clinic"]
+    record_file.write_text(json.dumps(record), encoding="utf-8")
+
+    loaded = load_result(sheet)
+
+    assert (loaded.tested_at, loaded.clinic) == (WHEN, None)   # no clinic written down, not "printed without one"
+
+
+def test_replacing_a_result_keeps_its_name_or_renames_it_for_another_patient(tmp_path):
+    from datetime import date
+
+    from tsm300.patient import Patient
+    from tsm300.store import load_result, save_result
+
+    measurement = parse_message(BOTH)
+    hong, kim = Patient("00512", "홍길동", "남", date(1975, 3, 4)), Patient("12345", "김하나")
+    first = save_result(measurement, tmp_path, WHEN, hong)
+
+    noted = save_result(measurement, tmp_path, WHEN, hong, "메모", replacing=first)
+
+    assert noted == first and load_result(noted).note == "메모"
+    assert sorted(files_in(tmp_path)) == ["20261126_211205_00512.bin", "20261126_211205_00512.jpg",
+                                          "20261126_211205_00512.json"]
+
+    moved = save_result(measurement, tmp_path, WHEN, kim, "메모", replacing=noted)
+
+    assert moved.name == "20261126_211205_12345.jpg" and load_result(moved).patient == kim
+    assert sorted(files_in(tmp_path)) == ["20261126_211205_12345.bin", "20261126_211205_12345.jpg",
+                                          "20261126_211205_12345.json"]
+
+
+def test_a_save_that_fails_leaves_the_earlier_files_exactly_as_they_were(tmp_path, monkeypatch):
+    from tsm300 import store
+
+    measurement = parse_message(BOTH)
+    sheet = store.save_result(measurement, tmp_path, WHEN)
+    before = files_in(tmp_path)
+
+    def no_room(*arguments, **options):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(store, "render", no_room)
+    with pytest.raises(OSError):
+        store.save_result(measurement, tmp_path, WHEN, note="메모", replacing=sheet)
+    with pytest.raises(OSError):
+        store.save_result(measurement, tmp_path / "new", WHEN)
+
+    assert files_in(tmp_path) == before
+    assert list((tmp_path / "new").iterdir()) == []
+
+
+def test_a_sheet_held_open_by_another_program_stops_the_change_before_anything_is_replaced(tmp_path, monkeypatch):
+    from tsm300 import store
+
+    measurement = parse_message(BOTH)
+    sheet = store.save_result(measurement, tmp_path, WHEN)
+    before = files_in(tmp_path)
+    real_replace = store.os.replace
+
+    def held_open(source, target):
+        if str(target).endswith(".jpg"):
+            raise PermissionError(13, "The process cannot access the file because it is being used by another process")
+        real_replace(source, target)
+
+    monkeypatch.setattr(store.os, "replace", held_open)
+    monkeypatch.setattr(store, "_REPLACE_PAUSE", 0)
+    with pytest.raises(PermissionError):
+        store.save_result(measurement, tmp_path, WHEN, note="메모", replacing=sheet)
+
+    assert files_in(tmp_path) == before
+
+
+def test_a_sheet_held_open_stops_a_rename_for_another_patient_and_leaves_no_second_copy(tmp_path, monkeypatch):
+    from tsm300 import store
+    from tsm300.patient import Patient
+
+    measurement = parse_message(BOTH)
+    sheet = store.save_result(measurement, tmp_path, WHEN)
+    before = files_in(tmp_path)
+    really_unlink = Path.unlink
+
+    def held_open(path, *arguments, **options):
+        if path == sheet:
+            raise PermissionError(13, "The process cannot access the file because it is being used by another process")
+        really_unlink(path, *arguments, **options)
+
+    monkeypatch.setattr(Path, "unlink", held_open)
+    with pytest.raises(PermissionError):
+        store.save_result(measurement, tmp_path, WHEN, Patient("12345", "김하나"), replacing=sheet)
+
+    assert files_in(tmp_path) == before
+
+
+def test_a_file_held_for_a_moment_by_a_virus_scanner_is_moved_on_the_next_try(tmp_path, monkeypatch):
+    from tsm300 import store
+
+    refusals = [PermissionError(13, "Access is denied"), PermissionError(13, "Access is denied")]
+    real_replace = store.os.replace
+
+    def briefly_held(source, target):
+        if refusals:
+            raise refusals.pop()
+        real_replace(source, target)
+
+    monkeypatch.setattr(store.os, "replace", briefly_held)
+    monkeypatch.setattr(store, "_REPLACE_PAUSE", 0)
+
+    sheet = store.save_result(parse_message(BOTH), tmp_path, WHEN)
+
+    assert refusals == [] and sorted(files_in(tmp_path)) == ["20261126_211205.bin", "20261126_211205.jpg",
+                                                              "20261126_211205.json"]
+    assert store.load_result(sheet).received_at == WHEN
+
+
+def test_decode_command_prints_the_clinic_from_the_settings_and_the_test_time_given(tmp_path):
+    from tsm300 import settings as settings_file
+    from tsm300.settings import Settings
+
+    settings_file.save(Settings(clinic_name="바른이비인후과의원", clinic_phone="051-123-4567"))
+
+    code = cli.main(["decode", str(DATA / "left_only.bin"), "--out", str(tmp_path), "--tested", "2026-11-25 14:30"])
+
+    assert code == 0
+    (record_file,) = tmp_path.glob("*.json")
+    record = json.loads(record_file.read_text(encoding="utf-8"))
+    assert record["tested_at"] == "2026-11-25T14:30:00"
+    assert record["clinic"] == {"name": "바른이비인후과의원", "address": "", "phone": "051-123-4567"}
+
+
+def test_decode_command_refuses_a_test_time_it_cannot_read_and_reports_a_file_it_cannot_open(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["decode", str(DATA / "left_only.bin"), "--out", str(tmp_path), "--tested", "어제"])
+
+    assert cli.main(["decode", str(tmp_path / "없는 파일.bin"), "--out", str(tmp_path)]) == 1
+    assert "파일을 읽지 못했습니다" in capsys.readouterr().out
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_save_that_fails_part_of_the_way_puts_back_every_file_it_had_replaced(tmp_path, monkeypatch):
+    from tsm300 import store
+
+    measurement = parse_message(BOTH)
+    sheet = store.save_result(measurement, tmp_path, WHEN, note="처음 메모")
+    before = files_in(tmp_path)
+    real_replace = store.os.replace
+
+    def record_held(source, target):
+        if str(target).endswith(".json") and "earlier" not in Path(target).name and "earlier" not in Path(source).name:
+            raise PermissionError(13, "Access is denied")
+        real_replace(source, target)
+
+    monkeypatch.setattr(store.os, "replace", record_held)
+    monkeypatch.setattr(store, "_REPLACE_PAUSE", 0)
+    with pytest.raises(PermissionError):
+        store.save_result(measurement, tmp_path, WHEN, note="고친 메모", replacing=sheet)     # the sheet was already placed
+    with pytest.raises(PermissionError):
+        store.save_result(measurement, tmp_path / "new", WHEN)                                 # as was a new result's
+
+    assert files_in(tmp_path) == before
+    assert files_in(tmp_path / "new") == {}
+
+
+def test_decode_command_says_when_the_sheet_will_carry_no_clinic_name(tmp_path, capsys):
+    from tsm300 import settings as settings_file
+    from tsm300.settings import Settings
+
+    cli.main(["decode", str(DATA / "left_only.bin"), "--out", str(tmp_path / "a")])
+    assert "결과지에 병원 이름이 인쇄되지 않습니다" in capsys.readouterr().out
+
+    settings_file.save(Settings(clinic_name="바른이비인후과의원"))
+    cli.main(["decode", str(DATA / "left_only.bin"), "--out", str(tmp_path / "b")])
+    assert "병원 이름" not in capsys.readouterr().out

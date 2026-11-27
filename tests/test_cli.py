@@ -12,22 +12,28 @@ def test_commands_run_where_there_are_no_output_streams(monkeypatch):
     assert cli.main(["ports"]) == 0
 
 
-def test_window_is_given_the_results_folder(tmp_path, monkeypatch):
+def test_window_is_started_with_what_was_asked_on_the_command_line(monkeypatch):
     import tsm300.app as app
 
-    folders = []
-    monkeypatch.setattr(app, "run", lambda args: folders.append(args.out) or 0)
-    monkeypatch.setenv("TSM300_DIR", str(tmp_path))
+    asked = []
+    monkeypatch.setattr(app, "run", lambda args: asked.append((args.out, args.port)) or 0)
 
     assert cli.main([]) == 0
-    assert folders == ["results"]
+    assert cli.main(["--out", "elsewhere", "--port", "COM7"]) == 0
 
-    monkeypatch.setattr(sys, "frozen", True, raising=False)
-    assert cli.main([]) == 0
-    assert folders[-1] == str(tmp_path / "results")
+    assert asked == [(None, None), ("elsewhere", "COM7")]
 
-    assert cli.main(["--out", "elsewhere"]) == 0
-    assert folders[-1] == "elsewhere"
+
+def test_test_time_for_a_redrawn_sheet_is_read_with_or_without_the_time():
+    from datetime import datetime
+
+    import pytest
+
+    assert cli.parse_moment("") is None
+    assert cli.parse_moment(" 2026-11-25 14:30 ") == datetime(2026, 11, 25, 14, 30)
+    assert cli.parse_moment("2026-11-25") == datetime(2026, 11, 25)
+    with pytest.raises(ValueError, match="검사일시"):
+        cli.parse_moment("어제")
 
 
 def test_update_command_tells_the_versions_and_installs_only_what_is_newer(tmp_path, monkeypatch, capsys):

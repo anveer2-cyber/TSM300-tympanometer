@@ -78,6 +78,7 @@ def test_install_puts_the_tried_download_in_the_programs_place(site, program):
     ((command, options),) = run.calls
     assert command == [str(program.with_name("TSM300.new.exe")), "--version"]
     assert options["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    assert update.RESTARTED not in options["env"]
     assert len(progress) > 1 and progress[-1] == (len(ReleaseSite.PROGRAM), len(ReleaseSite.PROGRAM))
 
 
@@ -131,6 +132,7 @@ def test_restart_starts_the_program_with_the_same_options_and_a_clean_slate(prog
     ((command, options),) = started
     assert command == [str(program), "--out", "D:\\검사결과"]
     assert options["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    assert options["env"][update.RESTARTED] == "1"       # so that it waits for this program to finish closing
     assert options["stdin"] == subprocess.DEVNULL
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import traceback
@@ -11,17 +12,20 @@ from pathlib import Path
 from typing import Callable
 
 import serial
-from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtCore import QDateTime, QEvent, QLockFile, QObject, QRect, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QIcon, QImage, QPageLayout, QPageSize, QPainter, QPixmap
+from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-    QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateTimeEdit, QDialog, QDialogButtonBox, QFileDialog,
+    QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
+    QProgressBar, QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from . import __version__, links
 from . import update as update_module
 from . import settings as settings_file
+from .archive import archive_directory, file_result, filed_sheet, refresh_copy
+from .clinic import Clinic
 from .console import available_ports, open_port
 from .listen import RETRY_AFTER, open_file, read_events
 from .patient import Order, Patient, PatientSource, parse_birth_date
@@ -30,16 +34,24 @@ from .records import Records, charts_tested_on, records_from_settings, send_shee
 from .report import prepare, wrap_note
 from .settings import Settings
 from .shortcut import ICON, claim_taskbar_identity
-from .store import delete_result, load_result, save_result
+from .store import load_result, note_in_record, save_result
 
 NO_SOURCE_NOTE = "차트번호 조회와 오늘 검사 오더 목록은 [설정]에서 환자 조회를 연결하면 쓸 수 있습니다. 지금은 직접 입력해 주세요."
 WAITING = "검사 결과를 기다리는 중입니다. 검사 후 장비의 → 키를 누르세요."
 SAVE_LABEL = "이 환자 정보로 저장"
 REPLACE_LABEL = "직전 결과지의 환자 바꾸기..."
+EDIT_LABEL = "검사일시 · 메모 저장"
+OUTPUT_LABEL = "출력 (인쇄 + 보내기 + 보관)"
+OUTPUT_LABEL_WITHOUT_SENDING = "출력 (인쇄 + 보관)"
 EDITED_AFTER_SENDING = "edited"
 ORDER_COLUMNS = ("접수", "차트번호", "이름", "나이·성별", "진료실", "검사")
 ORDERS_REFRESH_MS = 30_000
+EARLIEST_TEST = datetime(2000, 1, 1)
+PORT_SEARCH_MS = 3_000
 DONE_INK = QColor("#9a9a9a")
+NO_PORT = "시리얼 포트를 찾지 못했습니다. USB-시리얼 케이블을 꽂으면 자동으로 연결합니다."
+NO_CLINIC_HINT = "결과지에 인쇄할 병원 이름이 비어 있습니다. [설정] → 병원 정보에서 넣어 주세요."
+ALREADY_RUNNING = "TSM300 이 이미 켜져 있습니다.\n작업 표시줄에서 열려 있는 창을 찾아 주세요."
 
 Background = Callable[[QObject, Callable[[], object], Callable[[object, "Exception | None"], None]], None]
 
@@ -111,6 +123,16 @@ class SerialWorker(QThread):
             self.msleep(100)
 
 
+class NoWheel(QObject):
+    """Keeps the mouse wheel from changing a box it merely passes over while the panel is scrolled.
+
+    A test date or a patient's sex changed that way would be printed without anyone having meant it.
+    """
+
+    def eventFilter(self, watched, event) -> bool:
+        return event.type() == QEvent.Type.Wheel
+
+
 class SheetPreview(QLabel):
     """Shows the saved sheet scaled to whatever room the window gives it."""
 
@@ -172,18 +194,99 @@ class PatientConfirm(QDialog):
 
 
 class SettingsDialog(QDialog):
-    """Where patients are looked up and where result sheets are sent."""
+    """The clinic printed on the sheets, the device's port, where results are kept,
+    where patients are looked up and where sheets are sent."""
 
-    def __init__(self, parent: QWidget | None, settings: Settings, background: Background = run_in_background) -> None:
+    def __init__(self, parent: QWidget | None, settings: Settings, background: Background = run_in_background,
+                 ports: Callable[[], list] = available_ports, fixed_folder: Path | None = None) -> None:
         super().__init__(parent)
         self._original = settings
         self._background = background
+        self._ports = ports
         self.setWindowTitle("설정")
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(560)
         layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        self.tabs.addTab(self._clinic_tab(settings), "병원 정보")
+        self.tabs.addTab(self._device_tab(settings, fixed_folder), "장비 · 저장")
+        self.tabs.addTab(self._lookup_tab(settings), "환자 조회")
+        self.tabs.addTab(self._capture_tab(settings), "상쾌한캡처")
+        self.tabs.addTab(self._about_tab(), "프로그램 정보")
+        self.problem_label = QLabel()
+        self.problem_label.setWordWrap(True)
+        self.problem_label.setStyleSheet("color: #b3261e;")
+        layout.addWidget(self.problem_label)
+        buttons = QDialogButtonBox()
+        buttons.addButton("저장", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton("취소", QDialogButtonBox.ButtonRole.RejectRole)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.via_combo.currentIndexChanged.connect(self._show_fields)
+        self._show_fields()
 
-        lookup = QGroupBox("환자 조회")
-        form = QFormLayout(lookup)
+    def _clinic_tab(self, settings: Settings) -> QWidget:
+        tab = QWidget()
+        form = QFormLayout(tab)
+        self.clinic_name_edit = QLineEdit(settings.clinic_name)
+        self.clinic_name_edit.setPlaceholderText("예: ○○이비인후과의원")
+        form.addRow("병원 이름", self.clinic_name_edit)
+        self.clinic_address_edit = QLineEdit(settings.clinic_address)
+        self.clinic_address_edit.setPlaceholderText("예: ○○시 ○○구 ○○로 123, 2층")
+        form.addRow("주소", self.clinic_address_edit)
+        self.clinic_phone_edit = QLineEdit(settings.clinic_phone)
+        self.clinic_phone_edit.setPlaceholderText("예: 051-123-4567")
+        form.addRow("전화번호", self.clinic_phone_edit)
+        form.addRow(_note("결과지 맨 위에 병원 이름이, 맨 아래에 주소와 전화번호가 인쇄됩니다. 비워 둔 칸은 인쇄되지 않습니다.\n"
+                          "화면에 떠 있는 결과지와 지금부터 받는 결과지에 적용됩니다. "
+                          "이미 상쾌한캡처로 보낸 결과지는 그대로 둡니다."))
+        return tab
+
+    def _device_tab(self, settings: Settings, fixed_folder: Path | None) -> QWidget:
+        tab = QWidget()
+        form = QFormLayout(tab)
+        self.port_combo = QComboBox()
+        self.rescan_button = QPushButton("포트 다시 찾기")
+        self.rescan_button.clicked.connect(lambda: self._list_ports(self.port_combo.currentData()))
+        port_row = QHBoxLayout()
+        port_row.addWidget(self.port_combo, stretch=1)
+        port_row.addWidget(self.rescan_button)
+        form.addRow("장비 포트", port_row)
+        self._list_ports(settings.port)
+        form.addRow(_note("장비(TSM-300)의 SERIAL 단자와 연결된 포트입니다. 보통은 자동으로 두면 됩니다.\n"
+                          "자동: 장비가 한 번 응답한 USB-시리얼 케이블을 기억해서, 다른 USB 단자에 꽂아도 그 케이블만 엽니다. "
+                          "기억이 없을 때 케이블이 하나면 그것을 쓰고, 여러 개면 열지 않고 골라 달라고 합니다. "
+                          "다른 장비의 포트를 잘못 여는 일이 없게 하려는 것입니다.\n"
+                          "직접 고르면 그 포트만 씁니다. 케이블을 다른 USB 단자로 옮겨 이름이 바뀌면 다시 골라 주세요."))
+        self.folder_edit = QLineEdit(settings.results_dir)
+        self.folder_edit.setPlaceholderText(f"비워 두면: {settings_file.results_directory().resolve()}")
+        self.browse_button = QPushButton("찾아보기...")
+        self.browse_button.clicked.connect(lambda: self._browse(self.folder_edit, "저장 폴더"))
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(self.folder_edit, stretch=1)
+        folder_row.addWidget(self.browse_button)
+        form.addRow("저장 폴더", folder_row)
+        note = ("받은 결과가 모두 자동으로 저장되는 폴더입니다. 결과지(JPG)와 로데이터가 받은 시각 이름으로 들어갑니다. "
+                "환자 정보가 들어 있으니 다른 사람과 함께 쓰는 폴더는 피해 주세요.")
+        if fixed_folder is not None:
+            note += f"\n이번 실행은 시작할 때 명령(--out)으로 정한 폴더를 씁니다: {fixed_folder.resolve()}"
+        form.addRow(_note(note))
+        self.archive_edit = QLineEdit(settings.archive_dir)
+        self.archive_edit.setPlaceholderText("비워 두면: 저장 폴더 안의 '보관' 폴더")
+        self.archive_browse_button = QPushButton("찾아보기...")
+        self.archive_browse_button.clicked.connect(lambda: self._browse(self.archive_edit, "보관 폴더"))
+        archive_row = QHBoxLayout()
+        archive_row.addWidget(self.archive_edit, stretch=1)
+        archive_row.addWidget(self.archive_browse_button)
+        form.addRow("보관 폴더", archive_row)
+        form.addRow(_note("[출력]이나 [컴퓨터에 보관]을 누른 결과를 날짜별로 정리해 두는 폴더입니다. "
+                          "예: 보관\\2026-11\\2026-11-26\\00512_홍길동_1430.jpg (같은 이름의 .json, .bin 이 로데이터)"))
+        return tab
+
+    def _lookup_tab(self, settings: Settings) -> QWidget:
+        tab = QWidget()
+        form = QFormLayout(tab)
         self.via_combo = QComboBox()
         for label, value in (("쓰지 않음 (직접 입력만)", ""), ("매직차트 DB (이 PC 의 ODBC 연결)", "odbc"),
                              ("예진이 서버", "server")):
@@ -205,10 +308,12 @@ class SettingsDialog(QDialog):
         self.lookup_result = QLabel()
         self.lookup_result.setWordWrap(True)
         form.addRow(self.lookup_test_button, self.lookup_result)
-        layout.addWidget(lookup)
+        form.addRow(_note("전자차트에서 환자 정보와 오늘 검사 오더를 읽어 옵니다. 쓰지 않아도 환자 정보를 직접 넣어 쓸 수 있습니다."))
+        return tab
 
-        capture = QGroupBox("상쾌한캡처 (결과지 보내기)")
-        form = QFormLayout(capture)
+    def _capture_tab(self, settings: Settings) -> QWidget:
+        tab = QWidget()
+        form = QFormLayout(tab)
         self.cap_url_edit = QLineEdit(settings.cap_url)
         self.cap_url_edit.setPlaceholderText("진료실 PC 주소, 예: 192.168.0.10")
         form.addRow("받는 PC 주소", self.cap_url_edit)
@@ -224,21 +329,37 @@ class SettingsDialog(QDialog):
         self.capture_result = QLabel()
         self.capture_result.setWordWrap(True)
         form.addRow(self.capture_test_button, self.capture_result)
-        layout.addWidget(capture)
+        form.addRow(_note("결과지를 상쾌한캡처 프로그램으로 보내는 기능입니다. 상쾌한캡처를 쓰지 않으면 비워 둡니다."))
+        return tab
 
-        buttons = QDialogButtonBox()
-        buttons.addButton("저장", QDialogButtonBox.ButtonRole.AcceptRole)
-        buttons.addButton("취소", QDialogButtonBox.ButtonRole.RejectRole)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-        self.via_combo.currentIndexChanged.connect(self._show_fields)
-        self._show_fields()
+    def _about_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        folder = settings_file.settings_directory()
+        about = QLabel(
+            f"TSM300 v{__version__}\n"
+            "Oscilla TSM-300 임피던스 청력검사기의 결과를 받아 결과지로 만드는 프로그램입니다.\n\n"
+            f"설정 파일: {folder / settings_file.FILE_NAME}\n"
+            f"오류 기록: {folder / 'error.log'}\n\n"
+            "이 프로그램은 다음 공개 소프트웨어를 사용합니다. 각 소프트웨어의 저작권과 사용 조건은 해당 프로젝트에 있습니다.\n"
+            "Python (PSF License), Qt for Python · PySide6 (LGPL v3), Matplotlib (Matplotlib License), "
+            "NumPy (BSD), Pillow (MIT-CMU), pySerial (BSD), pyodbc (MIT), PyInstaller (GPL v2, 실행 파일 예외 조항)")
+        about.setWordWrap(True)
+        about.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(about)
+        layout.addStretch(1)
+        return tab
 
     def settings(self) -> Settings:
         """The settings as edited in the dialog."""
         return replace(
             self._original,
+            clinic_name=self.clinic_name_edit.text().strip(),
+            clinic_address=self.clinic_address_edit.text().strip(),
+            clinic_phone=self.clinic_phone_edit.text().strip(),
+            port=self.port_combo.currentData() or "",
+            results_dir=_full_path(self.folder_edit.text()),
+            archive_dir=_full_path(self.archive_edit.text()),
             emr_via=self.via_combo.currentData(),
             emr_dsn=self.dsn_edit.text().strip(),
             emr_server=self.server_edit.text().strip(),
@@ -247,6 +368,17 @@ class SettingsDialog(QDialog):
             cap_key=self.cap_key_edit.text().strip(),
             cap_on=self.cap_on_check.isChecked(),
         )
+
+    def accept(self) -> None:
+        """Closes only when the results folder can really be written to; a sheet that cannot be saved is a lost test."""
+        for name, box in (("저장 폴더", self.folder_edit), ("보관 폴더", self.archive_edit)):
+            chosen = _full_path(box.text())
+            problem = folder_problem(Path(chosen)) if chosen else ""
+            if problem:
+                self.tabs.setCurrentIndex(1)
+                self.problem_label.setText(f"⚠ {name}에 쓸 수 없습니다: {problem}")
+                return
+        super().accept()
 
     def test_lookup(self) -> None:
         records = records_from_settings(self.settings())
@@ -273,12 +405,56 @@ class SettingsDialog(QDialog):
 
         self._background(self, lambda: links.entcapture_hello(edited.cap_url, edited.cap_key), done)
 
+    def _list_ports(self, chosen: str | None) -> None:
+        """Fills the port list, keeping the chosen port in it even while its cable is unplugged."""
+        chosen = chosen or ""
+        self.port_combo.clear()
+        self.port_combo.addItem("자동 (USB-시리얼 포트를 찾아 연결)", "")
+        names = []
+        for port in self._ports():
+            names.append(port.device)
+            self.port_combo.addItem(f"{port.device} - {port.description}", port.device)
+        if chosen and chosen not in names:
+            self.port_combo.addItem(f"{chosen} - 지금은 보이지 않음", chosen)
+        self.port_combo.setCurrentIndex(max(0, self.port_combo.findData(chosen)))
+
+    def _browse(self, box: QLineEdit, title: str) -> None:
+        start = box.text().strip() or str(settings_file.results_directory().resolve())
+        chosen = QFileDialog.getExistingDirectory(self, title, start)
+        if chosen:
+            box.setText(str(Path(chosen)))
+
     def _show_fields(self) -> None:
         via = self.via_combo.currentData()
         self.dsn_edit.setEnabled(via == "odbc")
         self.server_edit.setEnabled(via == "server")
         self.token_edit.setEnabled(via == "server")
         self.lookup_test_button.setEnabled(bool(via))
+
+
+def folder_problem(folder: Path) -> str:
+    """Why results cannot be kept in ``folder``, or an empty string when they can."""
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        probe = folder / "~TSM300 쓰기 확인.tmp"
+        probe.write_bytes(b"")
+        probe.unlink()
+    except OSError as error:
+        return str(error)
+    return ""
+
+
+def _full_path(typed: str) -> str:
+    """A folder typed without a drive would otherwise mean a different place each time the
+    program is started from somewhere else."""
+    return os.path.abspath(typed.strip()) if typed.strip() else ""
+
+
+def _note(text: str) -> QLabel:
+    label = QLabel(text)
+    label.setWordWrap(True)
+    label.setStyleSheet("color: #666666;")
+    return label
 
 
 class UpdateDialog(QDialog):
@@ -385,15 +561,20 @@ class UpdateDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
+    port_wanted = Signal(str)
+    """Emitted with the port chosen in the settings (empty for finding one) when that changes."""
+
     def __init__(self, directory: Path, settings: Settings | None = None, source: PatientSource | None = None,
                  now: Callable[[], datetime] = datetime.now,
                  confirm: Callable[[str], bool] | None = None,
                  confirm_patient: Callable[[Patient], bool] | None = None,
                  background: Background = run_in_background,
                  send: Callable[..., dict] = send_sheet,
-                 settings_directory: Path | None = None, updates=update_module) -> None:
+                 settings_directory: Path | None = None, updates=update_module,
+                 directory_follows_settings: bool = False) -> None:
         super().__init__()
-        self._directory = directory
+        self._directory = _full(directory)
+        self._directory_follows_settings = directory_follows_settings
         self._updates = updates
         self._settings = settings or Settings()
         self._settings_directory = settings_directory
@@ -409,11 +590,23 @@ class MainWindow(QMainWindow):
         self._sheet: Path | None = None
         self._sheet_patient = Patient()
         self._sheet_note = ""
+        self._sheet_tested_at: datetime | None = None
+        self._sheet_clinic = self._settings.clinic
+        self._problem = ""
+        self._problem_is_about_edits = False
+        self._lost: tuple[Path, str, datetime] | None = None
+        self._filed = ""
+        self._filing_problem = ""
+        self._redraw_after_sending = False
+        self._close_agreed = False
         self._patient_is_new = False
         self._orders: list[Order] = []
         self._loading_orders = False
         self._sending = False
+        self._going: Path | None = None
+        self._outbox: list[tuple] = []
         self._sent: dict | None = None
+        self._no_wheel = NoWheel(self)
         self.setWindowTitle(f"TSM-300 임피던스 청력검사 v{__version__}")
         self.resize(1240, 840)
         self._build()
@@ -466,30 +659,59 @@ class MainWindow(QMainWindow):
         self.state_label.setStyleSheet("font-size: 15px; font-weight: 600; padding: 10px 12px;"
                                        " background: #f3f3f3; border-radius: 6px;")
         main.addWidget(self.state_label)
+        self.problem_label = QLabel()
+        self.problem_label.setWordWrap(True)
+        self.problem_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.problem_label.setStyleSheet("color: #8c1d18; background: #fdecea; padding: 8px 12px; border-radius: 6px;")
+        main.addWidget(self.problem_label)
+        self.clinic_hint = _note(NO_CLINIC_HINT)
+        self.clinic_hint.setContentsMargins(12, 0, 12, 0)
+        main.addWidget(self.clinic_hint)
         self.capture_label = QLabel()
         self.capture_label.setWordWrap(True)
         self.capture_label.setStyleSheet("padding: 0 12px;")
         main.addWidget(self.capture_label)
         self.preview = SheetPreview()
         main.addWidget(self.preview, stretch=1)
-        buttons = QHBoxLayout()
-        self.save_button = QPushButton(SAVE_LABEL)
-        self.save_button.clicked.connect(self.save_with_patient)
+        self.filing_label = QLabel()
+        self.filing_label.setWordWrap(True)
+        self.filing_label.setStyleSheet("padding: 0 12px;")
+        self.filing_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        main.insertWidget(main.count() - 1, self.filing_label)
+        actions = QHBoxLayout()
+        self.output_button = QPushButton(OUTPUT_LABEL)
+        self.output_button.setStyleSheet("font-weight: 700; padding: 6px 14px;")
+        self.output_button.setToolTip("결과지를 인쇄하고, 상쾌한캡처로 보내고, 결과지와 로데이터를 날짜별 보관 폴더에 정리해 둡니다.")
+        self.output_button.clicked.connect(self.output_sheet)
+        self.print_button = QPushButton("인쇄...")
+        self.print_button.setToolTip("결과지만 인쇄합니다.")
+        self.print_button.clicked.connect(self.print_sheet)
         self.send_button = QPushButton("상쾌한캡처로 보내기")
+        self.send_button.setToolTip("결과지만 상쾌한캡처로 보냅니다.")
         self.send_button.clicked.connect(self.send_to_capture)
+        self.file_button = QPushButton("컴퓨터에 보관")
+        self.file_button.setToolTip("결과지(JPG)와 로데이터(JSON, BIN)만 날짜별 보관 폴더에 정리해 둡니다.")
+        self.file_button.clicked.connect(self.file_sheet)
         self.open_button = QPushButton("결과지 열기")
         self.open_button.clicked.connect(self._open_sheet)
+        for button in (self.output_button, self.print_button, self.send_button, self.file_button):
+            actions.addWidget(button)
+        actions.addStretch(1)
+        actions.addWidget(self.open_button)
+        main.addLayout(actions)
+        folders = QHBoxLayout()
         earlier_button = QPushButton("지난 결과 열기...")
         earlier_button.clicked.connect(self._choose_result)
         folder_button = QPushButton("저장 폴더 열기")
+        folder_button.setToolTip("받은 결과가 모두 자동으로 저장되는 폴더입니다.")
         folder_button.clicked.connect(self._open_folder)
-        buttons.addWidget(self.save_button)
-        buttons.addWidget(self.send_button)
-        buttons.addWidget(self.open_button)
-        buttons.addStretch(1)
-        buttons.addWidget(earlier_button)
-        buttons.addWidget(folder_button)
-        main.addLayout(buttons)
+        filed_button = QPushButton("보관 폴더 열기")
+        filed_button.setToolTip("[출력]이나 [컴퓨터에 보관]을 누른 결과가 날짜별로 정리되는 폴더입니다.")
+        filed_button.clicked.connect(self._open_archive)
+        folders.addStretch(1)
+        for button in (earlier_button, folder_button, filed_button):
+            folders.addWidget(button)
+        main.addLayout(folders)
         columns.addLayout(main, stretch=1)
 
     def _build_orders(self) -> QGroupBox:
@@ -531,6 +753,7 @@ class MainWindow(QMainWindow):
         form.addRow("이름", self.name_edit)
         self.sex_combo = QComboBox()
         self.sex_combo.addItems(["", "남", "여"])
+        self.sex_combo.installEventFilter(self._no_wheel)
         form.addRow("성별", self.sex_combo)
         self.birth_edit = QLineEdit()
         self.birth_edit.setPlaceholderText("예: 1980-01-31 또는 19800131")
@@ -540,6 +763,9 @@ class MainWindow(QMainWindow):
         self.form_note.setWordWrap(True)
         self.form_note.setStyleSheet("color: #b3261e;")
         layout.addWidget(self.form_note)
+        self.save_button = QPushButton(SAVE_LABEL)
+        self.save_button.clicked.connect(self.save_with_patient)
+        layout.addWidget(self.save_button)
         clear_button = QPushButton("새 환자 (지우기)")
         clear_button.clicked.connect(self.clear_patient)
         layout.addWidget(clear_button)
@@ -553,10 +779,20 @@ class MainWindow(QMainWindow):
         return box
 
     def _build_note(self) -> QGroupBox:
-        box = QGroupBox("메모 (화면의 결과지에 인쇄됩니다)")
+        box = QGroupBox("화면의 결과지 고치기")
         layout = QVBoxLayout(box)
+        form = QFormLayout()
+        self.tested_edit = QDateTimeEdit()
+        self.tested_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self.tested_edit.setCalendarPopup(True)
+        self.tested_edit.setMinimumDateTime(QDateTime(EARLIEST_TEST))
+        self.tested_edit.installEventFilter(self._no_wheel)
+        self.tested_edit.dateTimeChanged.connect(self._show_state)
+        form.addRow("검사일시", self.tested_edit)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("메모"))
         self.note_edit = QPlainTextEdit()
-        self.note_edit.setFixedHeight(96)
+        self.note_edit.setFixedHeight(84)
         self.note_edit.setPlaceholderText("결과를 받은 뒤에 쓸 수 있습니다")
         self.note_edit.textChanged.connect(self._show_state)
         layout.addWidget(self.note_edit)
@@ -564,27 +800,61 @@ class MainWindow(QMainWindow):
         self.note_hint.setWordWrap(True)
         self.note_hint.setStyleSheet("color: #b3261e;")
         layout.addWidget(self.note_hint)
-        self.note_button = QPushButton("메모 저장")
-        self.note_button.clicked.connect(self.save_note)
+        self.note_button = QPushButton(EDIT_LABEL)
+        self.note_button.clicked.connect(self.save_edits)
         layout.addWidget(self.note_button)
         return box
 
     # ----- settings -----------------------------------------------------------------------
 
     def open_settings(self) -> None:
-        dialog = SettingsDialog(self, self._settings, self._background)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        fixed_folder = None if self._directory_follows_settings else self._directory
+        dialog = SettingsDialog(self, self._settings, self._background, fixed_folder=fixed_folder)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
             self.apply_settings(dialog.settings())
+        except OSError as error:
+            QMessageBox.warning(self, "설정", f"설정을 저장하지 못했습니다. 바꾼 내용은 적용하지 않았습니다.\n\n{error}")
 
     def apply_settings(self, settings: Settings) -> None:
-        """Saves the settings and switches patient lookup and sending over to them."""
+        """Saves the settings and switches the clinic's details, the device's port, the results
+        folder, patient lookup and sending over to them. Raises OSError, with nothing changed,
+        when the settings cannot be saved."""
+        previous = self._settings
+        # The dialog started from the settings as they were when it opened. What the program
+        # has learned by itself since then is not the dialog's to undo.
+        settings = replace(settings, port_heard=previous.port_heard, port_heard_id=previous.port_heard_id)
         settings_file.save(settings, self._settings_directory)
         if isinstance(self._source, Records):
             self._source.close()
         self._settings = settings
         self._source = records_from_settings(settings)
+        if self._directory_follows_settings:
+            self._directory = _full(settings_file.results_directory(settings.results_dir))
+        if settings.port != previous.port:
+            self.port_wanted.emit(settings.port)
+        if settings.clinic != previous.clinic and self._sheet is not None and not self._in_capture():
+            if self._sending and self._going == self._sheet:
+                self._redraw_after_sending = True  # not under a sheet that is on its way; see when it has arrived
+            else:
+                self._sheet_clinic = settings.clinic  # also if the sheet cannot be rewritten now: the next save carries it
+                self._save_again(self._sheet_patient, self._note_text(), send=False, tested_at=self._tested_value())
         self._show_source()
         self._show_state()
+
+    def remember_port(self, port: str, adapter: str = "") -> None:
+        """Notes the port and the adapter the device has just been heard on, which next time
+        tells its cable from the cables of other instruments."""
+        if not port or (port, adapter) == (self._settings.port_heard, self._settings.port_heard_id):
+            return
+        if not adapter and port == self._settings.port_heard:
+            return  # the same port, its adapter unknown this time: what is known of it is not thrown away
+        self._settings = replace(self._settings, port_heard=port, port_heard_id=adapter)
+        try:
+            settings_file.save(self._settings, self._settings_directory)
+        except OSError:
+            pass  # it only saves a choice in the settings; the device is connected either way
 
     def open_update(self) -> None:
         if UpdateDialog(self, self._updates, self._background).exec() == QDialog.DialogCode.Accepted:
@@ -592,12 +862,14 @@ class MainWindow(QMainWindow):
 
     def restart_updated(self) -> None:
         """Starts the newly installed program and closes this one, losing nothing typed."""
-        self._keep_unsaved_note()
+        if not self._may_close():
+            return
         try:
             self._updates.restart(self._updates.program_file(), sys.argv[1:])
         except OSError as error:
             QMessageBox.warning(self, "업데이트", f"새 버전을 켜지 못했습니다. 프로그램을 닫고 직접 다시 켜 주세요.\n\n{error}")
             return
+        self._close_agreed = True
         self.close()
 
     def _show_source(self) -> None:
@@ -754,42 +1026,152 @@ class MainWindow(QMainWindow):
         if not self._sheet_patient.is_empty:
             question = (f"직전 결과지는 {_who(self._sheet_patient)} 환자로 저장되어 있습니다.\n"
                         f"{_who(patient)} 환자의 결과로 바꿀까요?")
-            if self._sent and self._sent.get("ok"):
+            if self._in_capture():
                 question += (f"\n\n이 결과지는 이미 상쾌한캡처에 {_who(self._sheet_patient)} 환자로 들어가 있습니다. "
                              "그쪽 것은 상쾌한캡처 사진 이력에서 '중이검사' 카드를 오른쪽 클릭해 [삭제…]로 지워 주세요.")
+            asked_about = self._sheet
             if not self._confirm(question):
                 return
-        self._patient_is_new = False
-        self._save_again(patient, self._note_text(), send=self._settings.cap_on)
+            if self._sheet != asked_about:  # another result arrived while the question was open
+                self._problem = ("⚠ 답하는 동안 새 결과가 도착해서 환자를 바꾸지 않았습니다. "
+                                 "앞 결과지는 [지난 결과 열기...]로 열어 다시 바꿔 주세요.")
+                self._problem_is_about_edits = False
+                self._show_state()
+                return
+        was_new, self._patient_is_new = self._patient_is_new, False
+        if not self._save_again(patient, self._note_text(), send=self._settings.cap_on, tested_at=self._tested_value()):
+            self._patient_is_new = was_new
+            self._show_state()
 
-    def save_note(self) -> None:
-        """Prints the memo on the shown sheet. A sheet already sent is not sent again by itself,
-        because 상쾌한캡처 would keep both copies."""
-        if self._measurement is None or self._sheet is None or self._sending:
+    def save_edits(self) -> None:
+        """Prints the corrected test time and the memo on the shown sheet. A sheet already sent
+        is not sent again by itself, because 상쾌한캡처 would keep both copies."""
+        if self._measurement is None or self._sheet is None or self._sending or not self._edited():
             return
-        note = self._note_text()
-        if note == self._sheet_note:
+        self._save_again(self._sheet_patient, self._note_text(), tested_at=self._tested_value(),
+                         send=self._settings.cap_on and not self._in_capture(), only_edits=True)
+
+    def output_sheet(self) -> None:
+        """Does all a finished result needs, in one go: prints the sheet, files it with its raw
+        data on this PC and sends it to 상쾌한캡처. Each step also has a button of its own."""
+        if self._sheet is None or self._sending or not self._keep_unsaved_edits():
             return
-        was_sent = bool(self._sent and self._sent.get("ok"))
-        self._save_again(self._sheet_patient, note, send=self._settings.cap_on and not was_sent)
+        sheet = self._sheet  # another result may arrive and take the screen while a question or the printer is open
+        if self._sheet_patient.is_empty and not self._confirm(
+                "환자 정보가 없는 결과지입니다.\n환자 정보 없이 출력할까요? 상쾌한캡처로는 보내지 않습니다."):
+            return
+        printed = self._sheet == sheet and self._print(sheet)
+        if self._sheet != sheet:
+            done = "앞 결과지는 인쇄만 했습니다. 보관과 보내기는" if printed else "앞 결과지는 출력하지 않았습니다. 출력은"
+            self._problem = f"⚠ 출력하는 동안 새 결과가 도착했습니다. {done} [지난 결과 열기...]로 그 결과를 열어서 해 주세요."
+            self._problem_is_about_edits = False
+            self._show_state()
+            return
+        if not printed:
+            return
+        self._file()
+        if self._settings.capture_ready and not self._in_capture():
+            self._send_when_possible()
+
+    def print_sheet(self) -> None:
+        """Prints the shown sheet, with whatever was being corrected on it saved first."""
+        if self._sheet is not None and self._keep_unsaved_edits():
+            self._print(self._sheet)
+
+    def file_sheet(self) -> None:
+        """Files the shown sheet and its raw data in the archive folder, by date."""
+        if self._sheet is not None and not self._sending and self._keep_unsaved_edits():
+            self._file()
+
+    def _print(self, sheet: Path) -> bool:
+        """Prints ``sheet`` on the printer the operator chooses. False when nothing was printed."""
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+        printer.setPageOrientation(QPageLayout.Orientation.Portrait)
+        printer.setDocName(sheet.stem)
+        if not self._choose_printer(printer):
+            return False
+        try:
+            paint_sheet(sheet, printer)
+        except OSError as error:
+            QMessageBox.warning(self, "인쇄", f"인쇄하지 못했습니다.\n\n{error}")
+            return False
+        return True
+
+    def _file(self) -> bool:
+        """Puts the tidy copy of the shown result in the archive, in place of an earlier copy of it."""
+        try:
+            where = file_result(self._sheet, self._archive(), self._sheet_patient, self._sheet_tested_at, self._filed)
+        except (OSError, ValueError) as error:
+            self._filing_problem = f"⚠ 컴퓨터에 보관하지 못했습니다: {error}"
+            self._show_filing()
+            return False
+        self._filed, self._filing_problem = where, ""
+        try:
+            note_in_record(self._sheet, filed=where)
+        except (OSError, ValueError):
+            pass  # the copy is made and this window knows where; the record is told at the next save
+        self._show_filing()
+        return True
+
+    def _refile(self) -> None:
+        """Brings the tidy copy up to date after the result it is a copy of has changed."""
+        if self._filed and self._sheet is not None:
+            self._file()
+
+    def _archive(self) -> Path:
+        return archive_directory(self._directory, self._settings.archive_dir)
 
     def open_result(self, path: Path) -> None:
         """Shows a result saved earlier, so that its memo or patient can be corrected."""
-        try:
-            saved = load_result(path)
-        except ValueError as error:
-            self.state_label.setText(f"⚠ {error}")
+        if not self._keep_unsaved_edits():  # first, or the result on screen would be read back without them
             return
-        self._keep_unsaved_note()
+        try:
+            saved = load_result(_full(path))
+            if saved.filed_from is not None:
+                saved = self._behind_the_copy(saved)
+        except (ValueError, OSError) as error:
+            self._problem, self._problem_is_about_edits = f"⚠ {error}", False
+            self._show_state()
+            return
         self._measurement, self._received_at = saved.measurement, saved.received_at
         self._sheet, self._sheet_patient, self._sheet_note = saved.sheet, saved.patient, saved.note
+        self._sheet_tested_at = _minute(saved.tested_at)
+        # A sheet keeps the clinic it was printed with. One printed with none (or saved before
+        # that was written down) gets the clinic in the settings when it is next rewritten.
+        printed_with = saved.clinic is not None and not saved.clinic.is_empty
+        self._sheet_clinic = saved.clinic if printed_with else self._settings.clinic
         self._sent = dict(saved.capture[-1]) if saved.capture else None
+        self._filed, self._filing_problem = saved.filed, ""
+        self._problem, self._problem_is_about_edits = "", False
         self._fill_form(saved.patient)
         self._patient_is_new = False
-        self.note_edit.setPlainText(saved.note)
+        self._show_edits(saved.note, self._sheet_tested_at)
+        if self._lost is not None and self._lost[0] == saved.sheet:
+            _, note, tested_at = self._lost
+            self._lost = None
+            self._show_edits(note, tested_at)
+            self._problem = "저장하지 못했던 검사일시와 메모를 다시 채웠습니다. [검사일시 · 메모 저장]을 눌러 주세요."
+            self._problem_is_about_edits = True
         self.preview.show_sheet(self._sheet)
         self._show_capture()
+        self._show_filing()
         self._show_state()
+
+    def _behind_the_copy(self, copy):
+        """The result a tidy copy was made from, which is the one to correct, send and print.
+
+        When that result has gone from the results folder, it is made again there from the
+        copy, and the copy is filed again so that it points at it.
+        """
+        for origin in (copy.filed_from, self._directory / copy.filed_from.name):  # where it was, or moved with the folder
+            if origin.with_suffix(".json").exists() and origin.with_suffix(".bin").exists():
+                return load_result(_full(origin))
+        sheet = save_result(copy.measurement, self._directory, copy.received_at, copy.patient, copy.note, copy.capture,
+                            tested_at=copy.tested_at, clinic=copy.clinic or Clinic(), filed=copy.filed)
+        where = file_result(sheet, self._archive(), copy.patient, copy.tested_at, str(copy.sheet.with_suffix("")))
+        note_in_record(sheet, filed=where)
+        return load_result(sheet)
 
     def _choose_result(self) -> None:
         chosen, _ = QFileDialog.getOpenFileName(self, "지난 결과 열기", str(self._directory), "결과 (*.json)")
@@ -798,23 +1180,57 @@ class MainWindow(QMainWindow):
 
     def send_to_capture(self) -> None:
         """Sends the shown sheet to 상쾌한캡처, which checks the chart number and name against the records."""
-        if not self._can_send():
+        if not self._can_send() or not self._keep_unsaved_edits():
             return
-        sheet, patient, tested_on, settings = self._sheet, self._sheet_patient, self._received_at.date(), self._settings
-        internal_number = self._source.internal_number(patient.chart_no) if self._source is not None else ""
-        self._sending = True
-        self.capture_label.setText("상쾌한캡처로 보내는 중...")
+        internal_number = self._source.internal_number(self._sheet_patient.chart_no) if self._source is not None else ""
+        self._start_sending((self._sheet, self._sheet_patient, self._sheet_tested_at.date(), internal_number))
+
+    def _start_sending(self, item: tuple) -> None:
+        sheet, patient, tested_on, internal_number = item
+        settings = self._settings
+        self._sending, self._going = True, sheet
+        if sheet == self._sheet:
+            self.capture_label.setText("상쾌한캡처로 보내는 중...")
         self._show_state()
 
         def done(outcome, error) -> None:
-            self._sending = False
+            self._sending, self._going = False, None
+            redraw, self._redraw_after_sending = self._redraw_after_sending, False
             if sheet == self._sheet:
                 self._sent = outcome if error is None else {"ok": False, "code": "error", "error": str(error), "retry": True}
                 self._show_capture()
+                if redraw and not self._in_capture():  # it did not arrive, so it can still take the new clinic
+                    self._sheet_clinic = self._settings.clinic
+                    self._save_again(self._sheet_patient, self._note_text(), send=False, tested_at=self._tested_value())
+                else:
+                    self._refile()  # the copy's record then says what became of the sending
+            else:
+                try:
+                    refresh_copy(sheet)
+                except (OSError, ValueError):
+                    pass  # the result's own record holds the outcome; the copy catches up when it is next filed
             self._show_state()
             self._show_orders()
+            while self._outbox and not self._sending:
+                waiting = self._outbox.pop(0)
+                if waiting[0].exists():  # not one that was renamed for another patient while it waited
+                    self._start_sending(waiting)
 
         self._background(self, lambda: self._send(sheet, patient, tested_on, settings, internal_number), done)
+
+    def _send_when_possible(self) -> None:
+        """Sends the shown sheet now, or after the sheets that are still on their way: results
+        that arrive faster than they can be sent wait their turn, and none is left out."""
+        if not self._sending:
+            self.send_to_capture()
+        elif self._sheet_patient.chart_no and self._sheet_patient.name and self._settings.capture_ready:
+            internal_number = self._source.internal_number(self._sheet_patient.chart_no) if self._source is not None else ""
+            self._outbox = [item for item in self._outbox if item[0] != self._sheet]
+            self._outbox.append((self._sheet, self._sheet_patient, self._sheet_tested_at.date(), internal_number))
+
+    def _in_capture(self) -> bool:
+        """Whether 상쾌한캡처 holds a copy of the shown sheet, as it was sent or as it was before a correction."""
+        return bool(self._sent and (self._sent.get("ok") or self._sent.get("code") == EDITED_AFTER_SENDING))
 
     def _can_send(self) -> bool:
         return (self._sheet is not None and not self._sending and self._settings.capture_ready
@@ -833,46 +1249,154 @@ class MainWindow(QMainWindow):
             patient = self.patient() if self._patient_is_new else Patient()
         except ValueError:
             patient = Patient()
-        self._keep_unsaved_note()
-        self._measurement = measurement
-        self._received_at = self._now()
+        lost = None if self._keep_unsaved_edits() else (self._sheet, self._note_text(), self._tested_value())
+        received_at = self._now()
+        tested_at = _minute(received_at)
+        try:
+            sheet = save_result(measurement, self._directory, received_at, patient,
+                                tested_at=tested_at, clinic=self._settings.clinic)
+        except Exception as error:  # a full disk, a folder that has gone, a sheet that cannot be drawn
+            self._could_not_save(measurement, received_at, error)
+            return
+        self._measurement, self._received_at = measurement, received_at
+        self._sheet_clinic = self._settings.clinic
         self._sent = None
+        self._filed, self._filing_problem = "", ""
         self._patient_is_new = False
-        self.note_edit.setPlainText("")
-        self._saved(save_result(measurement, self._directory, self._received_at, patient), patient, "")
+        self._show_edits("", tested_at)
+        self._saved(sheet, patient, "", tested_at)
+        if lost is not None:
+            self._lost = lost
+            self._show_state()
         if self._settings.cap_on:
-            self.send_to_capture()
+            self._send_when_possible()
 
-    def _save_again(self, patient: Patient, note: str, send: bool) -> None:
-        """Rewrites the shown result with these details, keeping the record of what was sent."""
+    def _lost_text(self) -> str:
+        """What is said while corrections to an earlier result are waiting to be saved: they could
+        not be written when another result took the screen. They are kept, shown here, and put
+        back in their boxes when that result is opened again."""
+        if self._lost is None:
+            return ""
+        sheet, note, tested_at = self._lost
+        return (f"⚠ 앞 결과지({sheet.name})에 고치던 내용을 저장하지 못했습니다. [지난 결과 열기...]로 그 결과를 열면 "
+                f"아래 내용이 다시 채워집니다.\n검사일시: {tested_at:%Y-%m-%d %H:%M} · 메모: {note or '(없음)'}")
+
+    def _could_not_save(self, measurement: Measurement, received_at: datetime, error: Exception) -> None:
+        """Keeps what the device sent and says what to do. The result shown before stays as it was,
+        and the patient in the form stays in line, so sending again from the device is all it takes."""
+        folder = (self._settings_directory or settings_file.settings_directory()) / "unsaved"
+        kept = ""
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            raw = folder / f"{received_at:%Y%m%d_%H%M%S}.bin"
+            raw.write_bytes(measurement.raw)
+            kept = f"\n장비가 보낸 데이터는 {raw} 에 보관했습니다."
+        except OSError:
+            pass
+        if not isinstance(error, OSError):
+            write_error_log(folder.parent, "".join(traceback.format_exception(type(error), error, error.__traceback__)))
+        self._problem = (f"⚠ 방금 받은 결과를 저장하지 못했습니다: {error}\n저장 폴더({self._directory})를 확인한 뒤 "
+                         f"장비에서 → 키를 다시 눌러 주세요.{kept}")
+        self._problem_is_about_edits = False
+        self._show_state()
+
+    def _save_again(self, patient: Patient, note: str, send: bool, tested_at: datetime | None = None,
+                    only_edits: bool = False) -> bool:
+        """Rewrites the shown result with these details, keeping the record of what was sent.
+
+        Returns False, with the files as they were, when they cannot be rewritten.
+        ``only_edits`` says the save is of the test time and memo alone: a warning about
+        such a save goes away when the operator takes those back.
+        """
+        tested_at = tested_at or self._sheet_tested_at
+        clinic = self._sheet_clinic
         try:
             history = load_result(self._sheet).capture
         except ValueError:
             history = ()
+        sent = self._sent
         if self._sent and self._sent.get("ok"):
-            edited = {"ok": False, "code": EDITED_AFTER_SENDING, "error": "보낸 뒤 결과지를 고침", "retry": True,
-                      "at": self._now().isoformat(timespec="seconds")}
-            history += (edited,)
-            self._sent = edited
-        elif patient != self._sheet_patient:
-            self._sent = None
-        directory = self._sheet.parent
-        delete_result(self._sheet)
-        self._saved(save_result(self._measurement, directory, self._received_at, patient, note, history), patient, note)
+            sent = {"ok": False, "code": EDITED_AFTER_SENDING, "error": "보낸 뒤 결과지를 고침", "retry": True,
+                    "at": self._now().isoformat(timespec="seconds")}
+            history += (sent,)
+        elif patient != self._sheet_patient and not self._in_capture():
+            sent = None
+        try:
+            sheet = save_result(self._measurement, self._sheet.parent, self._received_at, patient, note, history,
+                                tested_at=tested_at, clinic=clinic, replacing=self._sheet, filed=self._filed)
+        except Exception as error:  # most often the sheet is open in another program, which holds the file
+            if not isinstance(error, OSError):
+                folder = self._settings_directory or settings_file.settings_directory()
+                write_error_log(folder, "".join(traceback.format_exception(type(error), error, error.__traceback__)))
+            self._problem = (f"⚠ 고친 내용을 저장하지 못했습니다: {error}\n"
+                             "결과지를 다른 프로그램에서 열어 두었다면 닫고 다시 저장해 주세요.")
+            # A warning about a memo or test time goes when those are taken back. One about a
+            # patient or clinic that could not be put on the sheet stays until a save succeeds.
+            self._problem_is_about_edits = only_edits
+            self._show_state()
+            return False
+        self._sent = sent
+        self._saved(sheet, patient, note, tested_at)
+        self._refile()
         if send:
-            self.send_to_capture()
+            self._send_when_possible()
+        return True
 
-    def _saved(self, sheet: Path, patient: Patient, note: str) -> None:
-        self._sheet, self._sheet_patient, self._sheet_note = sheet, patient, note
+    def _saved(self, sheet: Path, patient: Patient, note: str, tested_at: datetime) -> None:
+        self._sheet, self._sheet_patient, self._sheet_note, self._sheet_tested_at = sheet, patient, note, tested_at
+        self._problem, self._problem_is_about_edits = "", False
         self.preview.show_sheet(sheet)
         self._show_capture()
+        self._show_filing()
         self._show_state()
         self._show_orders()
 
-    def _keep_unsaved_note(self) -> None:
-        """Saves a memo typed for the shown result before another result takes its place."""
-        if self._measurement is not None and self._sheet is not None and self._note_text() != self._sheet_note:
-            self._save_again(self._sheet_patient, self._note_text(), send=False)
+    def _keep_unsaved_edits(self) -> bool:
+        """Saves a test time or memo changed for the shown result before something else takes its place.
+
+        Returns False when there was something to save and it could not be saved.
+        """
+        if self._measurement is None or self._sheet is None or not self._edited():
+            return True
+        return self._save_again(self._sheet_patient, self._note_text(), send=False, tested_at=self._tested_value(),
+                                only_edits=True)
+
+    def _may_close(self) -> bool:
+        """Saves what was being corrected, and asks before anything would be lost with the window:
+        corrections that cannot be saved, and sheets that have not finished going to 상쾌한캡처."""
+        if not self._keep_unsaved_edits() and not self._confirm(
+                "고치던 검사일시와 메모를 저장하지 못했습니다.\n결과지를 다른 프로그램에서 열어 두었다면 닫고 다시 해 주세요.\n\n"
+                "저장하지 않고 프로그램을 닫을까요?"):
+            return False
+        unsent = len(self._outbox) + (1 if self._sending else 0)
+        if unsent and not self._confirm(
+                f"상쾌한캡처로 아직 다 보내지 못한 결과지가 {unsent}건 있습니다.\n지금 닫으면 보내지지 않을 수 있습니다. "
+                "나중에 [지난 결과 열기...]로 열어 다시 보낼 수 있습니다.\n\n지금 닫을까요?"):
+            return False
+        return True
+
+    def closeEvent(self, event) -> None:
+        if not self._close_agreed and not self._may_close():
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def _edited(self) -> bool:
+        return self._note_text() != self._sheet_note or self._tested_value() != self._sheet_tested_at
+
+    def _show_edits(self, note: str, tested_at: datetime) -> None:
+        """Puts a result's memo and test time in the boxes where they are corrected."""
+        self.tested_edit.setDateTimeRange(
+            QDateTime(min(tested_at, EARLIEST_TEST)),
+            QDateTime(max(self._now(), tested_at).replace(hour=23, minute=59, second=0)))
+        self.tested_edit.setDateTime(QDateTime(tested_at))
+        self.note_edit.setPlainText(note)
+
+    def _tested_value(self) -> datetime | None:
+        """The test time in its box, or None while no result is shown."""
+        if self._sheet_tested_at is None:
+            return None
+        return _minute(self.tested_edit.dateTime().toPython())
 
     def _note_text(self) -> str:
         return self.note_edit.toPlainText().strip()
@@ -895,10 +1419,19 @@ class MainWindow(QMainWindow):
             self.form_note.setText(str(error))
         has_result = self._measurement is not None
         saved_for = self._sheet_patient
+        if self._problem_is_about_edits and not self._edited():  # what could not be saved has been taken back
+            self._problem, self._problem_is_about_edits = "", False
         next_up = not patient.is_empty and self._patient_is_new
         self.open_button.setEnabled(has_result)
-        self.note_edit.setEnabled(has_result)
-        self.note_button.setEnabled(has_result and not self._sending and self._note_text() != self._sheet_note)
+        self.print_button.setEnabled(has_result)
+        # Filing writes to the result's record, and so does a sending that is under way.
+        self.file_button.setEnabled(has_result and not self._sending)
+        self.output_button.setEnabled(has_result and not self._sending)
+        self.output_button.setText(OUTPUT_LABEL if self._settings.capture_ready else OUTPUT_LABEL_WITHOUT_SENDING)
+        self.note_edit.setEnabled(has_result and not self._sending)
+        self.tested_edit.setEnabled(has_result and not self._sending)
+        self.note_button.setEnabled(has_result and not self._sending and self._edited())
+        self.clinic_hint.setVisible(not self._settings.clinic.name)
         self.note_hint.setText("메모가 길어 결과지에는 앞부분만 인쇄됩니다." if wrap_note(self._note_text())[1] else "")
         self.send_button.setVisible(self._settings.capture_ready)
         self.send_button.setEnabled(self._can_send())
@@ -928,6 +1461,9 @@ class MainWindow(QMainWindow):
             text = (f"✔ 직전 결과는 {_who(saved_for)} 환자로 저장되어 있습니다. "
                     f"다음 검사는 {_who(patient)} 환자로 저장됩니다.")
         self.state_label.setText(text)
+        problems = "\n".join(part for part in (self._problem, self._lost_text()) if part)
+        self.problem_label.setText(problems)
+        self.problem_label.setVisible(bool(problems))
 
     def _show_capture(self) -> None:
         sent = self._sent
@@ -951,6 +1487,24 @@ class MainWindow(QMainWindow):
             text = f"⚠ 상쾌한캡처에 보내지 못했습니다: {sent.get('error')} ({sent.get('code')}).{later}"
         self.capture_label.setText(text)
 
+    def _show_filing(self) -> None:
+        if self._filing_problem:
+            text = self._filing_problem
+        elif self._filed and self._sheet is not None:
+            text = f"✔ 컴퓨터에 보관했습니다: {filed_sheet(self._filed)}"
+        else:
+            text = ""
+        self.filing_label.setText(text)
+        self.filing_label.setVisible(bool(text))
+
+    def _open_archive(self) -> None:
+        """Opens the day's folder of the shown result's tidy copy, or the archive itself."""
+        folder = filed_sheet(self._filed).parent if self._filed else self._archive()
+        if not folder.exists():
+            folder = self._archive()
+            folder.mkdir(parents=True, exist_ok=True)
+        open_file(folder)
+
     def _open_sheet(self) -> None:
         if self._sheet is not None:
             open_file(self._sheet)
@@ -959,25 +1513,264 @@ class MainWindow(QMainWindow):
         self._directory.mkdir(parents=True, exist_ok=True)
         open_file(self._directory)
 
+    def _choose_printer(self, printer: QPrinter) -> bool:
+        return QPrintDialog(printer, self).exec() == QDialog.DialogCode.Accepted
+
     def _ask(self, question: str) -> bool:
-        answer = QMessageBox.question(self, "환자 바꾸기", question)
+        answer = QMessageBox.question(self, "확인", question)
         return answer == QMessageBox.StandardButton.Yes
 
     def _ask_patient(self, patient: Patient) -> bool:
         return PatientConfirm(self, patient, self._now().date()).exec() == QDialog.DialogCode.Accepted
 
 
+def paint_sheet(sheet: Path, printer: QPrinter) -> None:
+    """Draws the sheet on one page of ``printer``, as large as the paper allows. Raises OSError when it cannot."""
+    image = QImage(str(sheet))
+    if image.isNull():
+        raise OSError(f"결과지 파일을 읽지 못했습니다: {sheet.name}")
+    printer.setFullPage(True)  # the sheet has its own margins; the printer's would shrink it
+    painter = QPainter()
+    if not painter.begin(printer):
+        raise OSError("프린터를 열지 못했습니다.")
+    try:
+        paper = printer.pageLayout().fullRectPixels(printer.resolution())
+        size = image.size().scaled(paper.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.drawImage(QRect((paper.width() - size.width()) // 2, (paper.height() - size.height()) // 2,
+                                size.width(), size.height()), image)
+    finally:
+        painter.end()
+
+
+def usb_adapters(ports: list) -> list:
+    return [port for port in ports if "USB" in (port.hwid or "").upper()]
+
+
+def adapter_identity(port) -> str:
+    """What tells one USB serial adapter from another whichever socket it is in: its maker,
+    model and serial number. Empty for a port that is not such an adapter."""
+    maker, model = getattr(port, "vid", None), getattr(port, "pid", None)
+    if maker is None or model is None:
+        return ""
+    return f"{maker:04X}:{model:04X}:{getattr(port, 'serial_number', None) or ''}"
+
+
+def pick_port(wanted: str, ports: list, current: str | None = None, heard: bool = False,
+              remembered: tuple[str, str] = ("", "")) -> str | None:
+    """The port to read the device on, out of the ports the PC has now, or None to read none.
+
+    A port the operator chose (``wanted``) is used when it is there and nothing takes its
+    place when it is not. Left to the program, the rules protect two things: a connection
+    that works, and the ports of other instruments on the same PC, which they cannot open
+    while this program holds them.
+
+    - A port the device has been ``heard`` on is kept for as long as it is there.
+    - Where the device was heard before is ``remembered`` as a port name and a USB serial
+      adapter (see ``adapter_identity``). That adapter is the device's cable whichever socket
+      and name it has now. While it is unplugged, nothing is opened in its place.
+    - A port remembered by name only (one of the PC's own, or from a version that did not
+      note the adapter) is used while it is there.
+    - With nothing to go by, a single USB serial adapter is taken to be the device's. Of
+      several, none is opened: the operator is asked to choose. With no adapter at all, a
+      port of the PC's own such as a desktop's COM1.
+    - Never a Bluetooth port: the device has no radio, and opening one can hang for a long time.
+    """
+    names = [port.device for port in ports]
+    if wanted:
+        return wanted if wanted in names else None
+    if heard and current in names:
+        return current
+    adapters = usb_adapters(ports)
+    own = [port.device for port in ports if port not in adapters and "BTHENUM" not in (port.hwid or "").upper()]
+    remembered_name, remembered_adapter = remembered
+    if remembered_adapter:
+        same = [port.device for port in adapters if adapter_identity(port) == remembered_adapter]
+        if remembered_name in same:
+            return remembered_name
+        return same[0] if len(same) == 1 else None
+    if remembered_name in own or remembered_name in [port.device for port in adapters]:
+        return remembered_name
+    if len(adapters) == 1:
+        return adapters[0].device
+    if adapters:
+        return None
+    return own[0] if own else None
+
+
+class Device(QObject):
+    """The link to the tympanometer: one reader on one port, and a look every few seconds at
+    which ports there are, so a cable plugged in or moved after the program started is found."""
+
+    status = Signal(str)
+    received = Signal(object)
+    heard_on = Signal(str, str)
+    """Emitted the first time the device is heard on a port, with the port's name and its adapter."""
+
+    def __init__(self, baud: int, ports: Callable[[], list] = available_ports, reader=SerialWorker,
+                 remembered: tuple[str, str] = ("", ""), background: Background = run_in_background,
+                 parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._baud = baud
+        self._ports = ports
+        self._reader = reader
+        self._remembered = remembered
+        self._background = background
+        self._wanted = ""
+        self._exactly = False
+        self._port: str | None = None
+        self._adapters: dict[str, str] = {}
+        self._worker = None
+        self._ending: list = []
+        self._said = ""
+        self._heard = False
+        self._listing = False
+        self._search = QTimer(self)
+        self._search.setInterval(PORT_SEARCH_MS)
+        self._search.timeout.connect(self.look_later)
+
+    def use(self, wanted: str, exactly: bool = False) -> None:
+        """Reads from the port ``wanted``, or from one the program finds when ``wanted`` is empty.
+
+        ``exactly`` is for a port named when the program was started: it is opened whether
+        or not the PC lists it, as some virtual ports are not listed.
+        """
+        self._wanted, self._exactly = wanted, exactly and bool(wanted)
+        self._said = ""
+        self.look(afresh=True)
+        self._search.start()
+
+    def stop(self) -> None:
+        """Ends reading for good, waiting for the readers to finish, as the program closes."""
+        self._search.stop()
+        self._stop_reading()
+        self._port, self._said = None, ""
+        for worker in list(self._ending):
+            if not worker.wait(3000):  # stuck opening a port; it must not outlive the objects it uses
+                worker.terminate()
+                worker.wait(1000)
+        self._ending.clear()
+
+    def look(self, afresh: bool = False) -> None:
+        """Sees which ports there are and starts, moves or stops reading to match.
+
+        ``afresh`` forgets the port in use, for when the operator has just chosen differently.
+        """
+        self._settle(self._ports(), afresh)
+
+    def look_later(self) -> None:
+        """The look repeated every few seconds. Listing the ports is slow on some PCs, so it
+        is done away from the window, which would otherwise stutter under the operator's typing."""
+        if self._exactly or self._listing:
+            return
+        self._listing = True
+
+        def listed(ports, error) -> None:
+            self._listing = False
+            if error is None and self._search.isActive():
+                self._settle(ports)
+
+        self._background(self, self._ports, listed)
+
+    def _settle(self, ports: list, afresh: bool = False) -> None:
+        self._adapters = {listed.device: adapter_identity(listed) for listed in ports}
+        if self._exactly:
+            port = self._wanted
+        else:
+            port = pick_port(self._wanted, ports, None if afresh else self._port, self._heard and not afresh,
+                             self._remembered)
+        if port is None:
+            missing = self._why_none(ports)
+            if self._port is not None or missing != self._said:
+                self._stop_reading()
+                self._port, self._said = None, missing
+                self.status.emit(missing)
+            return
+        if port == self._port:
+            return
+        self._stop_reading()
+        self._port, self._said, self._heard = port, "", False
+        self._worker = self._reader(port, self._baud)
+        self._worker.status.connect(self.status)
+        self._worker.received.connect(self._hear)
+        self._worker.start()
+
+    def _why_none(self, ports: list) -> str:
+        if self._wanted:
+            return f"{self._wanted} 포트가 보이지 않습니다. 케이블을 꽂으면 자동으로 연결합니다."
+        adapters = usb_adapters(ports)
+        if self._remembered[1] and not any(adapter_identity(port) == self._remembered[1] for port in adapters):
+            return ("장비의 USB-시리얼 케이블이 연결되어 있지 않습니다. 꽂으면 자동으로 연결합니다. "
+                    "케이블을 다른 것으로 바꿨다면 [설정] → 장비 · 저장에서 포트를 골라 주세요.")
+        if adapters:
+            return (f"USB-시리얼 포트({', '.join(port.device for port in adapters)}) 중 어느 것이 장비인지 알 수 없어 "
+                    "열지 않았습니다. [설정] → 장비 · 저장에서 장비가 연결된 포트를 골라 주세요.")
+        return NO_PORT
+
+    def _hear(self, event) -> None:
+        if isinstance(event, (Measurement, PowerOn)) and not self._heard:
+            self._heard = True  # only this device speaks like that: the port is the right one
+            self._remembered = (self._port, self._adapters.get(self._port, ""))
+            self.heard_on.emit(*self._remembered)
+        self.received.emit(event)
+
+    def _stop_reading(self) -> None:
+        """Tells the reader to end and lets it, without holding the window up: closing a port
+        can take a moment, and a reader must not be destroyed while it still runs."""
+        worker, self._worker = self._worker, None
+        if worker is None:
+            return
+        worker.status.disconnect(self.status)
+        worker.received.disconnect(self._hear)
+        self._ending.append(worker)
+        worker.finished.connect(lambda: self._ended(worker))
+        worker.requestInterruption()
+        if worker.isFinished():
+            self._ended(worker)
+
+    def _ended(self, worker) -> None:
+        if worker in self._ending:
+            self._ending.remove(worker)
+
+
+def only_instance(folder: Path, wait_ms: int) -> QLockFile | None:
+    """The lock that makes this the one running window, or None when another already holds it.
+
+    Two windows would fight over the device's port. Waiting a little lets a program that is
+    restarting itself after an update finish closing first.
+    """
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    lock = QLockFile(str(folder / "running.lock"))
+    lock.setStaleLockTime(0)  # a lock is stale when its program has gone, however recently it was taken
+    if lock.tryLock(wait_ms) or lock.error() != QLockFile.LockError.LockFailedError:
+        return lock  # held, or the folder cannot hold a lock at all, which must not stop the program starting
+    return None
+
+
+def results_folder(chosen_on_start: str | None, settings: Settings) -> tuple[Path, bool]:
+    """Where results go, and whether that follows the settings from now on (not when given on starting)."""
+    if chosen_on_start:
+        return Path(chosen_on_start), False
+    return settings_file.results_directory(settings.results_dir), True
+
+
+def write_error_log(directory: Path, text: str) -> None:
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        with open(directory / "error.log", "a", encoding="utf-8") as log:
+            log.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} v{__version__}\n{text}\n")
+    except OSError:
+        pass
+
+
 def report_crashes(directory: Path) -> None:
     """Writes unexpected errors to ``error.log`` and shows them; started from a shortcut there is no console."""
 
     def hook(kind, error, trace) -> None:
-        text = "".join(traceback.format_exception(kind, error, trace))
-        try:
-            directory.mkdir(parents=True, exist_ok=True)
-            with open(directory / "error.log", "a", encoding="utf-8") as log:
-                log.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} v{__version__}\n{text}\n")
-        except OSError:
-            pass
+        write_error_log(directory, "".join(traceback.format_exception(kind, error, trace)))
         if QApplication.instance() is not None:
             QMessageBox.critical(None, "TSM300 오류", f"예상하지 못한 오류가 났습니다.\n\n{error}\n\n"
                                  f"자세한 내용은 {directory / 'error.log'} 에 적었습니다.")
@@ -985,57 +1778,61 @@ def report_crashes(directory: Path) -> None:
     sys.excepthook = hook
 
 
+INSTANCE_WAIT_MS = 8_000
+INSTANCE_CHECK_MS = 300
+
+
 def run(args) -> int:
     claim_taskbar_identity()
     app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setWindowIcon(QIcon(str(ICON)))
+    folder = settings_file.settings_directory()
+    after_update = os.environ.pop(update_module.RESTARTED, None) is not None
+    lock = only_instance(folder, INSTANCE_WAIT_MS if after_update else INSTANCE_CHECK_MS)
+    if lock is None:
+        QMessageBox.information(None, "TSM300", ALREADY_RUNNING)
+        return 1
     usual_hook = sys.excepthook
-    report_crashes(settings_file.settings_directory())
+    report_crashes(folder)
     try:
         return _run_window(app, args)
     finally:
         sys.excepthook = usual_hook
+        lock.unlock()
 
 
 def _run_window(app: QApplication, args) -> int:
     prepare()
     settings = settings_file.load()
-    window = MainWindow(Path(args.out), settings)
-    port = args.port or _pick_port(settings)
-    worker = None
-    if port:
-        worker = SerialWorker(port, args.baud)
-        worker.status.connect(window.show_connection)
-        worker.received.connect(window.handle_event)
-        worker.start()
-    else:
-        window.show_connection("시리얼 포트를 찾지 못했습니다. 케이블을 연결하고 프로그램을 다시 켜 주세요.")
+    directory, follows_settings = results_folder(args.out, settings)
+    window = MainWindow(directory, settings, directory_follows_settings=follows_settings)
+    device = Device(args.baud, remembered=(settings.port_heard, settings.port_heard_id))
+    device.status.connect(window.show_connection)
+    device.received.connect(window.handle_event)
+    device.heard_on.connect(window.remember_port)
+    window.port_wanted.connect(device.use)
+    device.use(args.port or settings.port, exactly=bool(args.port))
     window.show()
     program = update_module.program_file()
     if program is not None:  # just after an update the replaced file is still in use by the program that started this one
         QTimer.singleShot(20_000, lambda: update_module.clean_up(program))
     code = app.exec()
-    if worker is not None:
-        worker.requestInterruption()
-        worker.wait(3000)
+    device.stop()
     window.close()
     window.deleteLater()
     app.processEvents()
     return code
 
 
-def _pick_port(settings: Settings) -> str | None:
-    """The port used last time if it is still there, otherwise the first USB serial adapter."""
-    ports = available_ports()
-    names = [port.device for port in ports]
-    if settings.port in names:
-        return settings.port
-    usb = [port.device for port in ports if "USB" in (port.hwid or "").upper()]
-    chosen = (usb or names or [None])[0]
-    if chosen:
-        settings.port = chosen
-        settings_file.save(settings)
-    return chosen
+def _full(path: Path) -> Path:
+    """The path spelled out in full. Sheets are told apart by their paths, and the same sheet
+    reached through a folder given in short and through a file picker must compare equal."""
+    return Path(os.path.abspath(path))
+
+
+def _minute(moment: datetime) -> datetime:
+    """Test times are shown, corrected and compared to the minute."""
+    return moment.replace(second=0, microsecond=0)
 
 
 def _who(patient: Patient) -> str:

@@ -241,6 +241,14 @@ def test_charts_with_a_result_today_are_found_from_the_saved_records(tmp_path):
     assert charts_tested_on(tmp_path / "missing", DAY) == set()
 
 
+def test_a_result_received_today_but_tested_another_day_does_not_count_as_tested_today(tmp_path):
+    save_result(BOTH, tmp_path, datetime(2026, 11, 26, 9, 30), HONG, tested_at=datetime(2026, 11, 25, 16, 0))
+    save_result(BOTH, tmp_path, datetime(2026, 11, 26, 9, 45), Patient("12345", "김하나"),
+                tested_at=datetime(2026, 11, 26, 9, 40))
+
+    assert charts_tested_on(tmp_path, DAY) == {"12345"}
+
+
 def test_a_result_of_another_kind_of_test_does_not_count_as_tympanometry_done(tmp_path):
     sheet = save_result(BOTH, tmp_path, datetime(2026, 11, 26, 9, 30), HONG)
     record_file = sheet.with_suffix(".json")

@@ -143,15 +143,21 @@ def _same_number(one: str, other: str) -> bool:
 
 
 def charts_tested_on(directory: Path, day: date) -> set[str]:
-    """Chart numbers that already have a saved tympanometry result on ``day``."""
+    """Chart numbers with a tympanometry result received and tested on ``day``.
+
+    Only the files received that day are read, to keep this quick in a folder of years of
+    results. One of them whose test time was corrected to another day is left out: a test
+    done yesterday and sent from the device's memory today is not today's test.
+    """
     charts = set()
     for path in directory.glob(f"{day:%Y%m%d}_*.json"):
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
             chart = record["patient"]["chart_no"]
-        except (OSError, ValueError, KeyError, TypeError):
+            tested = str(record.get("tested_at") or record["received_at"])[:10]
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             continue
-        if chart and exam_of(record) == EXAM_KIND:
+        if chart and exam_of(record) == EXAM_KIND and tested == day.isoformat():
             charts.add(chart)
     return charts
 
