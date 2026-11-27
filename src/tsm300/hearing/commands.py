@@ -24,21 +24,21 @@ DEMO_NOTE = ("견본 데이터입니다. 실제 환자가 아닙니다.\n"
 
 
 def check(args, console: Console) -> int:
-    console.say("청력검사기 점검 (MRS Resonance) — 기기의 검사를 읽기만 하고 아무것도 바꾸지 않습니다.\n")
+    console.say("청력검사기 점검 (MRS Resonance): 기기의 검사를 읽기만 하고 아무것도 바꾸지 않습니다.\n")
     if args.simulator:
         console.say("모의 장비로 합니다. 실제 청력검사기가 아닙니다.")
     else:
         try:
             paths = device.usb_devices()
         except device.DeviceError as error:
-            console.say(f"⚠ {error}")
+            console.say(f"※ {error}")
             return 1
         from .winusb import INTERFACE_GUID
         console.say(f"USB 에 연결된 청력검사기: {len(paths)}대 (MRS 드라이버의 장치 GUID {INTERFACE_GUID})")
         for path in paths:
             console.say(f"  {path}")
         if not paths:
-            console.say("⚠ 청력검사기를 찾지 못했습니다. 기기 전원, USB 선, MRS 드라이버 설치를 확인해 주세요.")
+            console.say("※ 청력검사기를 찾지 못했습니다. 기기 전원, USB 선, MRS 드라이버 설치를 확인해 주세요.")
             return 1
     folder = Path(args.out) if args.out else log_folder()
     opener = device.opener_for(device.SIMULATOR if args.simulator else device.USB)
@@ -49,7 +49,7 @@ def check(args, console: Console) -> int:
     except device.DeviceError as error:
         if live:
             console.clear_status()
-        console.say(f"⚠ {error}")
+        console.say(f"※ {error}")
         return 1
     if live:
         console.clear_status()
@@ -70,7 +70,7 @@ def summary(fetched: device.Fetched) -> list[str]:
     lines = [f"일련번호: {download.serial or '알려 주지 않음'}",
              f"기기 환자 {len(download.groups)}명, 검사 {len(download.tests)}건, "
              f"끝 신호 {'받음' if download.finished else '못 받음'}, 알아보지 못한 조각 {len(download.corrupt)}개"]
-    lines += [f"⚠ {warning}" for warning in fetched.warnings]
+    lines += [f"※ {warning}" for warning in fetched.warnings]
     order = 0
     for group in download.groups:
         who = group.patient

@@ -64,7 +64,8 @@ class Fetched:
             said.append(NOT_FINISHED)
         if self.download.corrupt:
             pieces = len(self.download.corrupt)
-            said.append(f"알아보지 못한 자료 {pieces}조각이 있었습니다. 주고받은 기록에 남겼습니다.")
+            said.append(f"오는 도중 망가진 자료 {pieces}조각은 버렸습니다(주고받은 기록에 남김). 검사가 빠졌으면 "
+                        "[청력검사기에서 받기]를 한 번 더 누르세요. 기기가 검사를 그대로 갖고 있어 온전히 다시 옵니다.")
         return said
 
 

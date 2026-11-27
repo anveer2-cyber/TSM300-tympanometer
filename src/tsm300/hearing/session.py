@@ -83,11 +83,8 @@ class Session:
         self._log("PC>", data)
         self._link.write(data)
 
-    def _events(self, until: float) -> list:
-        """Whatever arrives before ``until`` (at least one read)."""
-        if self._held:
-            held, self._held = self._held, []
-            return held
+    def _read(self, until: float) -> list:
+        """What one read of the link brings (it waits up to the link's timeout)."""
         data = self._link.read()
         if data:
             self._log("<DEV", data)
@@ -96,65 +93,90 @@ class Session:
             return self._decoder.flush()
         return []
 
+    def _events(self, until: float) -> list:
+        """Packets put aside while waiting for an answer first, then one read."""
+        if self._held:
+            held, self._held = self._held, []
+            return held
+        return self._read(until)
+
+    def _wait_for_answer(self, wait: float, answers: Callable[[object], bool]) -> bool:
+        """Reads until ``answers`` accepts a packet or ``wait`` seconds pass. Anything else that comes
+        meanwhile (a test sent unasked, a ping) is put aside for the download, never read twice."""
+        deadline = self._clock() + wait
+        aside = []
+        answered = False
+        while not answered and self._clock() < deadline:
+            for event in self._read(deadline):
+                if isinstance(event, p.Frame) and event.kind != p.KIND_PATIENT:
+                    # Answers, acks and pings are taken now and never kept: an ack kept for later
+                    # would read as the end of the download.
+                    self._note(event)
+                    answered = answered or answers(event)
+                else:
+                    aside.append(event)  # a test or patient sent unasked: kept for the download
+        self._held.extend(aside)
+        return answered
+
     # --- steps -------------------------------------------------------------------------
 
     def identify(self, wait: float = ANSWER_WAIT) -> str:
         """Asks who the device is, twice at most as the maker does. Returns the serial number."""
         for _ in range(2):
             self.send(p.identify(usb=self._usb))
-            deadline = self._clock() + wait
-            while self._clock() < deadline:
-                for event in self._events(deadline):
-                    self._note(event)
-                if self.serial:
-                    return self.serial
+            if self._wait_for_answer(wait, lambda event: event.kind == p.KIND_IDENTIFICATION):
+                return self.serial
         raise SessionError("청력검사기가 답하지 않습니다")
 
     def download(self, quiet: float = QUIET_END, limit: float = DOWNLOAD_LIMIT,
                  progress: Callable[[int], None] | None = None) -> Download:
         """Fetches every test in the device's memory."""
         self.send(p.identify(usb=self._usb))
-        deadline = self._clock() + ANSWER_WAIT
-        answered = False
-        while not answered and self._clock() < deadline:
-            for event in self._events(deadline):
-                if isinstance(event, p.Frame) and (event.command == p.ACK or event.kind == p.KIND_IDENTIFICATION):
-                    self._note(event)
-                    answered = True
-                else:
-                    self._held.append(event)  # a test sent unasked: keep it for the download
+        self._wait_for_answer(ANSWER_WAIT, lambda event: isinstance(event, p.Frame) and (
+            event.command == p.ACK or event.kind == p.KIND_IDENTIFICATION))
         self.send(p.command(p.GET_ALL))
         groups: list[DeviceGroup] = []
         corrupt: list[p.Corrupt] = []
         received = bytearray()
         start = last = self._clock()
         finished = False
+
+        def take(event) -> bool:
+            """Files one event; True when it is the device's 'that was everything'."""
+            if isinstance(event, p.Corrupt):
+                corrupt.append(event)
+                return False
+            received.extend(event.packet.raw if hasattr(event, "packet") else event.raw)
+            if isinstance(event, p.Frame) and event.kind == p.KIND_PATIENT:
+                groups.append(DeviceGroup(p.device_patient(event)))
+            elif isinstance(event, (p.ToneAudiogram, p.SpeechAudiogram, p.OtherTest)):
+                if not groups:
+                    groups.append(DeviceGroup(None))
+                groups[-1].tests.append(event)
+                if not self.serial:
+                    self.serial = event.packet.serial
+                if progress:
+                    progress(sum(len(g.tests) for g in groups))
+            elif isinstance(event, p.Frame) and event.command in (p.ACK, p.NACK):
+                return True
+            else:
+                self._note(event)
+            return False
+
         while not finished:
             now = self._clock()
             if now - last > quiet or now - start > limit:
                 break
             for event in self._events(last + quiet):
                 last = self._clock()
-                if isinstance(event, p.Corrupt):
-                    corrupt.append(event)
-                    continue
-                raw = event.packet.raw if hasattr(event, "packet") else event.raw
-                received += raw
-                if isinstance(event, p.Frame) and event.kind == p.KIND_PATIENT:
-                    groups.append(DeviceGroup(p.device_patient(event)))
-                elif isinstance(event, (p.ToneAudiogram, p.SpeechAudiogram, p.OtherTest)):
-                    if not groups:
-                        groups.append(DeviceGroup(None))
-                    groups[-1].tests.append(event)
-                    if not self.serial:
-                        self.serial = event.packet.serial
-                    if progress:
-                        progress(len([t for g in groups for t in g.tests]))
-                elif isinstance(event, p.Frame) and event.command in (p.ACK, p.NACK):
+                if take(event):
                     finished = True
                     break
-                else:
-                    self._note(event)
+        if not finished:
+            # The device went quiet without its closing ack: whole packets still waiting behind a
+            # broken one are recovered rather than lost.
+            for event in self._decoder.flush():
+                take(event)
         return Download(self.serial, [g for g in groups if g.tests], finished, bytes(received), corrupt)
 
     def close(self) -> None:

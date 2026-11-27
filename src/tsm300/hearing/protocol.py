@@ -452,8 +452,45 @@ def _speech(packet: Packet, body: bytes) -> SpeechAudiogram:
 
 # --- the byte stream -----------------------------------------------------------------------
 
+KNOWN_KINDS = frozenset(b"TtCAIQfJdWL MpqrS") | frozenset(FIXED_SIZES)
+"""Every packet kind the maker's program knows (docs/hearing/통신_절차.md §6.1)."""
+MAX_DATA = {KIND_TEST: 16384, KIND_TEST_R1: 16384, KIND_COMMAND: 64}
+MAX_OTHER_DATA = 8192
+"""The largest data a packet of each kind may claim. A tympanogram, the largest, is about 8 kB."""
+
+
+def _start_at(buffer, i: int) -> str:
+    """Whether a packet could start at ``i``: 'no', 'wait' (not all of it is in yet) or 'yes'
+    (all of it is in and its end mark and check byte are right)."""
+    if buffer[i] != START:
+        return "no"
+    if i + 1 >= len(buffer):
+        return "wait"
+    kind = buffer[i + 1]
+    if kind not in KNOWN_KINDS:
+        return "no"
+    if kind in FIXED_SIZES:
+        return "yes" if i + FIXED_SIZES[kind] <= len(buffer) else "wait"
+    if i + 4 > len(buffer):
+        return "wait"
+    n = int.from_bytes(buffer[i + 2:i + 4], "big")
+    if n > MAX_DATA.get(kind, MAX_OTHER_DATA):
+        return "no"
+    end = i + n + 6
+    if end > len(buffer):
+        return "wait"
+    if buffer[end - 1] != END or xor(buffer[i + 4:end - 2]) != buffer[end - 2]:
+        return "no"
+    return "yes"
+
+
 class StreamDecoder:
-    """Turns the bytes read from the device into results, other packets and corrupt pieces."""
+    """Turns the bytes read from the device into results, other packets and corrupt pieces.
+
+    However the bytes come — noise, a packet cut short when the cable moved, a wrong check
+    byte — it never stops for good and never takes a good packet for part of a bad one: a
+    bad stretch is dropped up to the next place where a whole, correct packet starts.
+    """
 
     def __init__(self) -> None:
         self._buffer = bytearray()
@@ -469,25 +506,25 @@ class StreamDecoder:
             pass
         return events
 
-    def flush(self) -> list[Corrupt]:
-        leftover = bytes(self._buffer)
-        self._buffer.clear()
-        return [Corrupt("packet stopped part-way", leftover)] if leftover else []
+    def flush(self) -> list:
+        """The link went quiet: whatever is left is not going to be completed. Recovers any whole
+        packet still inside it and reports the rest as corrupt."""
+        events: list = []
+        while self._buffer:
+            if not self._step(events):
+                self._skip(events, "packet stopped part-way", final=True)
+        return events
 
     def _step(self, events: list) -> bool:
         buffer = self._buffer
-        start = buffer.find(bytes([START]))
-        if start == -1:
-            if buffer:
-                events.append(Corrupt("bytes outside a packet", bytes(buffer)))
-                buffer.clear()
+        if not buffer:
             return False
-        if start > 0:
-            events.append(Corrupt("bytes outside a packet", bytes(buffer[:start])))
-            del buffer[:start]
+        state = _start_at(buffer, 0)
+        if state == "no":
+            return self._skip(events, self._why_not(buffer))
+        if state == "wait":
+            return False
         size = packet_length(buffer)
-        if size is None or len(buffer) < size:
-            return False
         chunk = bytes(buffer[:size])
         try:
             event = parse_packet(chunk) if chunk[1] == KIND_TEST else parse_frame(chunk)
@@ -497,14 +534,35 @@ class StreamDecoder:
         del buffer[:size]
         return True
 
-    def _skip(self, events: list, reason: str) -> bool:
-        """Drops bytes up to the next possible packet start after a bad one."""
+    @staticmethod
+    def _why_not(buffer) -> str:
+        if buffer[0] != START:
+            return "bytes outside a packet"
+        if len(buffer) < 2 or buffer[1] not in KNOWN_KINDS:
+            return "unknown packet kind"
+        try:
+            check_frame(bytes(buffer[:packet_length(buffer)]))
+        except ProtocolError as error:
+            return str(error)
+        return "packet claims more data than any packet holds"
+
+    def _skip(self, events: list, reason: str, final: bool = False) -> bool:
+        """Drops a bad stretch up to the next whole, correct packet. When none is in yet, up to the
+        first place one could still be arriving (none at all when ``final``)."""
         buffer = self._buffer
-        resume = buffer.find(bytes([START]), 1)
-        end = len(buffer) if resume == -1 else resume
+        resume = None
+        waiting = None
+        for i in range(1, len(buffer)):
+            state = _start_at(buffer, i)
+            if state == "yes":
+                resume = i
+                break
+            if state == "wait" and waiting is None and not final:
+                waiting = i
+        end = resume if resume is not None else (waiting if waiting is not None else len(buffer))
         events.append(Corrupt(reason, bytes(buffer[:end])))
         del buffer[:end]
-        return bool(buffer)
+        return resume is not None
 
 
 # --- commands the PC may send --------------------------------------------------------------
