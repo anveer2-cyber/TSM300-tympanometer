@@ -401,7 +401,7 @@ def _draw_note(figure: Figure, labels: dict, note: str) -> None:
 def _draw_footer(figure: Figure, labels: dict, device: str, clinic: Clinic) -> None:
     """The clinic's address and telephone on the left; the device and this program on the right."""
     _rule(figure, 279)
-    source = f"{device} · TSM300 v{__version__}"
+    source = " · ".join(part for part in (device, f"TSM300 v{__version__}") if part)
     _text(figure, PAGE_WIDTH - MARGIN, 284, source, size=8, color=INK_SECONDARY, ha="right")
     address, phone = _printable(clinic.address, labels), _printable(clinic.phone, labels)
     contact = " · ".join(part for part in (address, labels["phone"].format(phone=phone) if phone else "") if part)

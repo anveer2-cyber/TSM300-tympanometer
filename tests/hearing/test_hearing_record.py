@@ -186,8 +186,10 @@ def test_a_hearing_result_is_saved_as_three_files_and_reads_back_the_same(tmp_pa
     assert (saved["exam"], saved["format"]) == (EXAM, FORMAT) == ("hearing", 1)
     assert saved["patient"]["chart_no"] == "12345" and saved["note"] == "메모"
     assert saved["tested_at"] == "2026-11-27T10:30:00" and saved["received_at"] == "2026-11-27T10:30:12"
-    assert list(saved) == ["format", "exam", "received_at", "tested_at", "clinic", "patient", "note", "device",
-                           "device_patients", "tests", "tone", "speech", "high_frequency", "capture", "filed"]
+    assert list(saved) == ["format", "exam", "received_at", "tested_at", "clinic", "patient", "note", "remarks",
+                           "source", "device", "device_patients", "tests", "tone", "speech", "high_frequency",
+                           "corrections", "capture", "filed"]
+    assert (saved["source"], saved["corrections"], saved["remarks"]) == ("device", [], "")
     with Image.open(sheet) as image:
         assert image.size == (2480, 3508)
 

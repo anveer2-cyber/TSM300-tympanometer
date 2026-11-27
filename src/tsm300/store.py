@@ -54,11 +54,13 @@ class SavedResult:
     """Where the result's tidy copy is: its full path without a suffix; empty when it has none."""
     filed_from: Path | None = None
     """For a tidy copy itself: the sheet it is a copy of."""
+    remarks: str = ""
+    """What the staff note about the test for themselves. Kept with the result, never printed."""
 
 
 def result_to_dict(measurement: Measurement | HearingResult, received_at: datetime, patient: Patient, note: str = "",
                    capture: tuple[dict, ...] = (), tested_at: datetime | None = None,
-                   clinic: Clinic = Clinic(), filed: str = "") -> dict:
+                   clinic: Clinic = Clinic(), filed: str = "", remarks: str = "") -> dict:
     hearing = isinstance(measurement, HearingResult)
     common = {
         "format": hearing_record.FORMAT if hearing else FORMAT,
@@ -68,6 +70,7 @@ def result_to_dict(measurement: Measurement | HearingResult, received_at: dateti
         "clinic": clinic.to_dict(),
         "patient": patient.to_dict(),
         "note": note,
+        "remarks": remarks,
     }
     if hearing:
         values = hearing_record.record(measurement)
@@ -98,19 +101,20 @@ def draw(measurement: Measurement | HearingResult, path: Path, tested_at: dateti
 def save_result(measurement: Measurement | HearingResult, directory: Path, received_at: datetime,
                 patient: Patient = Patient(), note: str = "", capture: tuple[dict, ...] = (), *,
                 tested_at: datetime | None = None, clinic: Clinic = Clinic(),
-                replacing: Path | None = None, filed: str = "") -> Path:
+                replacing: Path | None = None, filed: str = "", remarks: str = "") -> Path:
     """Writes the three files of one result and returns the path of the sheet (the .jpg).
 
     ``replacing`` is the sheet of an earlier save of the same result, whose files these take
     the place of. Raises OSError when the files cannot be written, and then the folder is as
-    it was before: either all three files are put in place or none is.
+    it was before: either all three files are put in place or none is. ``remarks`` go in the
+    record only; the sheet never shows them. A hearing result typed in by hand has an empty .bin.
     """
     directory.mkdir(parents=True, exist_ok=True)
     wanted = "_".join(part for part in (received_at.strftime("%Y%m%d_%H%M%S"), patient.file_tag()) if part)
     replaced = replacing.stem if replacing is not None and replacing.parent == directory else None
     stem = free_stem(directory, wanted, replaced)
     unfinished = {suffix: directory / f"{_UNFINISHED}{stem}{suffix}" for suffix in _IN_ORDER_OF_RISK}
-    record = result_to_dict(measurement, received_at, patient, note, capture, tested_at, clinic, filed)
+    record = result_to_dict(measurement, received_at, patient, note, capture, tested_at, clinic, filed, remarks)
     try:
         unfinished[".bin"].write_bytes(measurement.raw)
         unfinished[".json"].write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -181,7 +185,8 @@ def load_result(path: Path) -> SavedResult:
     clinic = Clinic.from_dict(record["clinic"]) if isinstance(record.get("clinic"), dict) else None
     filed_from = Path(str(record["filed_from"])) if record.get("filed_from") else None
     return SavedResult(sheet, measurement, received_at, tested_at, Patient.from_dict(_dict(record.get("patient"))),
-                       str(record.get("note") or ""), clinic, capture, str(record.get("filed") or ""), filed_from)
+                       str(record.get("note") or ""), clinic, capture, str(record.get("filed") or ""), filed_from,
+                       str(record.get("remarks") or ""))
 
 
 def note_in_record(sheet: Path, **fields) -> None:

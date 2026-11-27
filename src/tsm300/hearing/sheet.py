@@ -100,7 +100,9 @@ def render(result: HearingResult, path: Path, tested_at: datetime, patient: Pati
         _draw_header(figure, page, clinic, tested_at, title(result, labels))
         _draw_patient(figure, page, patient, tested_at)
         _draw_note(figure, page, note)
-        _draw_footer(figure, page, labels["device"].format(serials=", ".join(result.serials)), clinic)
+        # A result typed in by hand came from no device: its footer names only this program.
+        device = labels["device"].format(serials=", ".join(result.serials)) if result.serials else ""
+        _draw_footer(figure, page, device, clinic)
         options = {"quality": 95, "subsampling": 0} if Path(path).suffix.lower() in (".jpg", ".jpeg") else {}
         figure.savefig(path, dpi=DPI, pil_kwargs=options)
 

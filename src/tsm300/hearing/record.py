@@ -9,6 +9,13 @@ sheet as the aided ones (SPKR-A), beside the unaided curves of another test. Tha
 clinic measures before and after the hearing aid: two soundfield tests, the second one with
 the aid in, which used to need two sheets.
 
+The values on the sheet may be corrected by hand, and a result may be typed in by hand with
+no device at all. Corrections lie over the decoded values and never change the packets: a
+result keeps the tests as the device sent them, and a list of ``Correction`` that says, value
+by value, what the sheet shows instead. A result typed in by hand (``manual``) has no tests,
+and every value on it is such a correction. The sheet shows the corrected values as if they
+had come that way; only the saved JSON tells them from the device's.
+
 ``record`` turns a result into the part of the saved JSON that is particular to hearing tests,
 and ``from_saved`` reads it back from the raw packets and that JSON. The layout is the contract
 in docs/hearing/원자료_형식.md.
@@ -16,8 +23,8 @@ in docs/hearing/원자료_형식.md.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import date
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime
 
 from . import protocol as p
 from .pta import METHODS, Average, average
@@ -30,6 +37,12 @@ FORMAT = 1
 a field that is removed or changes its meaning gives a new number."""
 
 TONE, SPEECH, HIGH_FREQUENCY = "tone", "speech", "high_frequency"
+SRT = "srt"
+"""The section of a correction to a speech test's SRT."""
+SECTIONS = (TONE, HIGH_FREQUENCY, SPEECH, SRT)
+DEVICE, MANUAL = "device", "manual"
+"""Where a result's values came from: the audiometer, or typed in by hand."""
+SPEECH_POINTS = 10
 
 AIDED = {"Spkr": "SpkrA", "Spkr1": "SpkrA1"}
 """Where a soundfield curve goes when its test was done with hearing aids."""
@@ -103,8 +116,8 @@ class Placed:
     kind: str
     ear: str
     curve: object
-    part: int
-    """Which of the result's parts it came from."""
+    part: int | None
+    """Which of the result's parts it came from; None for a curve put in by hand."""
 
 
 @dataclass(frozen=True)
@@ -112,23 +125,70 @@ class PlacedSrt:
     kind: str
     ear: str
     level: int | None
-    device_kind: str
-    part: int
+    device_kind: str | None
+    part: int | None
+    """None for an SRT put in by hand where the device sent none."""
+
+
+@dataclass(frozen=True)
+class TypedSpeechPoint(p.SpeechPoint):
+    """A speech point as corrected or typed in by hand. The number of words given is a value of
+    its own here, where the device's is worked out from the words repeated and the score."""
+
+    given_words: int | None = None
+
+    @property
+    def words(self) -> int | None:
+        return self.given_words
+
+
+@dataclass(frozen=True)
+class Correction:
+    """One value of the sheet put in by hand, in place of what the device sent or where it sent nothing."""
+
+    section: str
+    """``tone``, ``high_frequency``, ``speech`` (a point of a speech curve) or ``srt``."""
+    ear: str
+    kind: str
+    """The row the value is in on the sheet (``SpkrA`` for a soundfield test done with hearing aids)."""
+    key: int
+    """The frequency of a tone value, the number (from 1, in the order measured) of a speech point; 0 for an SRT."""
+    value: object
+    """What the sheet shows: a ``TonePoint``, a speech point or an SRT in dB HL. None: nothing."""
+    device: object = None
+    """What the device sent for it, in the same form; None when it sent nothing there."""
+    at: str = ""
+    """When it was put in, ``YYYY-MM-DDTHH:MM:SS``."""
+
+    @property
+    def cell(self) -> tuple[str, str, str, int]:
+        return (self.section, self.ear, self.kind, self.key)
 
 
 @dataclass(frozen=True)
 class HearingResult:
-    parts: tuple[Part, ...]
+    parts: tuple[Part, ...] = ()
+    corrections: tuple[Correction, ...] = ()
+    """The values put in by hand, over what the parts hold. Settled when the result is made:
+    one for each value, each saying what the device sent, none that changes nothing."""
+    manual: bool = False
+    """Typed in by hand, without the device: no parts, every value a correction."""
     tone: dict = field(init=False, repr=False, compare=False)
-    """(kind, ear) -> ``Placed`` for the pure tone curves."""
+    """(kind, ear) -> ``Placed`` for the pure tone curves, as the sheet shows them."""
     speech: dict = field(init=False, repr=False, compare=False)
     srt: dict = field(init=False, repr=False, compare=False)
     high_frequency: dict = field(init=False, repr=False, compare=False)
+    device_values: dict = field(init=False, repr=False, compare=False)
+    """Every value as the device sent it, by cell (see ``cells``)."""
+    _device: dict = field(init=False, repr=False, compare=False)
+    _numbers: dict = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "parts", tuple(self.parts))
-        if not self.parts:
+        if not self.parts and not self.manual:
             raise MergeError("고른 검사가 없습니다.")
+        if self.parts and self.manual:
+            raise MergeError("직접 입력한 결과에는 기기의 검사를 넣지 않습니다.")
         places: dict[str, dict] = {TONE: {}, SPEECH: {}, HIGH_FREQUENCY: {}}
         srt: dict = {}
         for index, part in enumerate(self.parts):
@@ -147,24 +207,77 @@ class HearingResult:
                         raise MergeError(f"어음 {KIND_NAMES.get(shown, shown)} {EAR_NAMES[entry.ear]} SRT 가 "
                                          f"두 검사에 들어 있습니다. 하나만 고르세요.{_hint(shown)}")
                     srt[(shown, entry.ear)] = PlacedSrt(shown, entry.ear, entry.level, entry.kind, index)
-        object.__setattr__(self, "tone", places[TONE])
-        object.__setattr__(self, "speech", places[SPEECH])
-        object.__setattr__(self, "high_frequency", places[HIGH_FREQUENCY])
-        object.__setattr__(self, "srt", srt)
+        places[SRT] = srt
+        numbers = {key: tuple(range(1, len(placed.curve.points) + 1)) for key, placed in places[SPEECH].items()}
+        device = _cells(places, numbers)
+        corrections = _settled(self.corrections, device)
+        object.__setattr__(self, "corrections", corrections)
+        object.__setattr__(self, "device_values", device)
+        object.__setattr__(self, "_device", places)
+        shown = _corrected(places, numbers, corrections) if corrections else (places, numbers)
+        object.__setattr__(self, "tone", shown[0][TONE])
+        object.__setattr__(self, "speech", shown[0][SPEECH])
+        object.__setattr__(self, "high_frequency", shown[0][HIGH_FREQUENCY])
+        object.__setattr__(self, "srt", shown[0][SRT])
+        object.__setattr__(self, "_numbers", shown[1])
+
+    # --- values by hand ----------------------------------------------------------------------
+
+    def cells(self) -> dict:
+        """Every value on the sheet, by cell: (section, ear, kind, key) -> value, as in ``Correction``.
+        A cell with nothing in it is not there."""
+        return _cells({TONE: self.tone, HIGH_FREQUENCY: self.high_frequency, SPEECH: self.speech, SRT: self.srt},
+                      self._numbers)
+
+    def with_cells(self, changes: dict, at: datetime) -> HearingResult:
+        """The same result with the values in ``changes`` (cell -> value, None for an emptied cell)
+        put in by hand at ``at``. Cells left out keep what they show now. A value put back as the
+        device sent it stops being a correction; one that is not changed keeps its time."""
+        wanted = self.cells()
+        wanted.update(changes)
+        when = at.isoformat(timespec="seconds")
+        earlier = {correction.cell: correction for correction in self.corrections}
+        corrections = []
+        for cell in set(wanted) | set(self.device_values) | set(earlier):
+            value = wanted.get(cell)
+            if _same(cell[0], value, self.device_values.get(cell)):
+                continue
+            before = earlier.get(cell)
+            kept = before is not None and _same(cell[0], before.value, value)
+            corrections.append(Correction(*cell, value=value, at=before.at if kept else when))
+        return HearingResult(self.parts, tuple(corrections), self.manual)
+
+    def speech_numbers(self, kind: str, ear: str) -> tuple[int, ...]:
+        """The numbers (from 1, in the order measured) of the points of a speech curve on the sheet."""
+        return self._numbers.get((kind, ear), ())
+
+    def device_curve(self, section: str, kind: str, ear: str):
+        """The curve the device sent for a row, before any correction; None when it sent none."""
+        placed = self._device[section].get((kind, ear))
+        return placed.curve if placed else None
+
+    @property
+    def is_empty(self) -> bool:
+        """Nothing at all on the sheet."""
+        return not (self.tone or self.speech or self.srt or self.high_frequency)
 
     # --- what it holds ---------------------------------------------------------------------
 
     @property
     def has_tone(self) -> bool:
-        return any(part.type == TONE for part in self.parts)
+        return bool(self.tone) or self._has_part(TONE)
 
     @property
     def has_speech(self) -> bool:
-        return any(part.type == SPEECH for part in self.parts)
+        return bool(self.speech or self.srt) or self._has_part(SPEECH)
 
     @property
     def has_high_frequency(self) -> bool:
-        return any(part.type == HIGH_FREQUENCY for part in self.parts)
+        return bool(self.high_frequency) or self._has_part(HIGH_FREQUENCY)
+
+    def _has_part(self, kind: str) -> bool:
+        """A test of this kind was received. Once values are corrected, the sheet goes by what it shows."""
+        return not self.corrections and any(part.type == kind for part in self.parts)
 
     @property
     def has_soundfield(self) -> bool:
@@ -237,31 +350,215 @@ def _hint(kind: str) -> str:
     return " 뒤의 검사가 보청기를 끼고 한 음장검사면 그 검사의 [보청기 착용]에 체크하세요."
 
 
+# --- corrections ---------------------------------------------------------------------------------
+
+_TONE_LIKE = (TONE, HIGH_FREQUENCY)
+
+
+def _cells(places: dict, numbers: dict) -> dict:
+    """Every value in ``places`` (section -> (kind, ear) -> placed) by cell."""
+    cells: dict = {}
+    for section in _TONE_LIKE:
+        for (kind, ear), placed in places[section].items():
+            for point in placed.curve.points:
+                cells[(section, ear, kind, point.frequency)] = point
+    for (kind, ear), placed in places[SPEECH].items():
+        for number, point in zip(numbers.get((kind, ear), ()), placed.curve.points):
+            cells[(SPEECH, ear, kind, number)] = point
+    for (kind, ear), entry in places[SRT].items():
+        if entry.level is not None:
+            cells[(SRT, ear, kind, 0)] = entry.level
+    return cells
+
+
+def value_to_dict(section: str, value) -> dict | int | None:
+    """A cell's value as the saved record writes it."""
+    if value is None:
+        return None
+    if section in _TONE_LIKE:
+        return {"level_db_hl": value.level, "masking_db": value.masking, "masked": value.masked,
+                "no_response": value.no_response}
+    if section == SPEECH:
+        return _speech_point(value)
+    return int(value)
+
+
+def _same(section: str, one, other) -> bool:
+    return value_to_dict(section, one) == value_to_dict(section, other)
+
+
+def _checked(correction: Correction) -> Correction:
+    """The correction, or ValueError when it cannot be one: a cell that does not exist, a value of the wrong form."""
+    section, ear, kind, key, value = (correction.section, correction.ear, correction.kind, correction.key,
+                                      correction.value)
+    if section not in SECTIONS or ear not in EAR_NAMES or kind not in KIND_NAMES:
+        raise ValueError(f"고친 값의 자리를 알 수 없습니다 ({section} {ear} {kind})")
+    if section in _TONE_LIKE:
+        if value is not None and not (isinstance(value, p.TonePoint) and value.frequency == key):
+            raise ValueError(f"고친 순음 값의 형식이 맞지 않습니다 ({ear} {kind} {key} Hz)")
+    elif section == SPEECH:
+        if not 1 <= key <= SPEECH_POINTS or (value is not None and not isinstance(value, p.SpeechPoint)):
+            raise ValueError(f"고친 어음 값의 형식이 맞지 않습니다 ({ear} {kind} {key})")
+    elif value is not None and not isinstance(value, int):
+        raise ValueError(f"고친 SRT 의 형식이 맞지 않습니다 ({ear} {kind})")
+    return correction
+
+
+def _settled(corrections, device: dict) -> tuple[Correction, ...]:
+    """One correction per cell (the last one given), each with what the device sent there, without
+    those that change nothing, in the order of the sheet."""
+    latest = {}
+    for correction in corrections:
+        latest[_checked(correction).cell] = correction
+    settled = []
+    for cell, correction in latest.items():
+        sent = device.get(cell)
+        if not _same(cell[0], correction.value, sent):
+            settled.append(replace(correction, value=_typed(correction.value), device=sent))
+    return tuple(sorted(settled, key=lambda correction: _cell_rank(correction.cell)))
+
+
+def _typed(value):
+    """A speech point given by hand always counts its words itself, however it was made."""
+    if isinstance(value, p.SpeechPoint) and not isinstance(value, TypedSpeechPoint):
+        return TypedSpeechPoint(value.level, value.score, value.masking, value.masked, value.correct,
+                                given_words=value.words)
+    return value
+
+
+def _cell_rank(cell: tuple) -> tuple:
+    section, ear, kind, key = cell
+    return (SECTIONS.index(section), ear != "R", _rank(kind), key)
+
+
+def _corrected(places: dict, numbers: dict, corrections: tuple[Correction, ...]) -> tuple[dict, dict]:
+    """``places`` and the speech points' numbers as the sheet shows them once ``corrections`` are made."""
+    by_row: dict = {}
+    for correction in corrections:
+        by_row.setdefault((correction.section, correction.kind, correction.ear), []).append(correction)
+    shown = {section: dict(rows) for section, rows in places.items()}
+    shown_numbers = dict(numbers)
+    for (section, kind, ear), changes in by_row.items():
+        row = (kind, ear)
+        placed = places[section].get(row)
+        if section == SRT:
+            if changes[-1].value is None:
+                shown[SRT].pop(row, None)
+            else:
+                shown[SRT][row] = PlacedSrt(kind, ear, changes[-1].value, placed.device_kind if placed else None,
+                                            placed.part if placed else None)
+            continue
+        if section == SPEECH:
+            values = dict(zip(numbers.get(row, ()), placed.curve.points)) if placed else {}
+        else:
+            values = {point.frequency: point for point in placed.curve.points} if placed else {}
+        for change in changes:
+            if change.value is None:
+                values.pop(change.key, None)
+            else:
+                values[change.key] = change.value
+        if not values:
+            shown[section].pop(row, None)
+            shown_numbers.pop(row, None)
+            continue
+        keys = sorted(values)
+        points = tuple(values[key] for key in keys)
+        if placed is not None:
+            curve = replace(placed.curve, points=points)
+        elif section == SPEECH:
+            curve = p.SpeechCurve(name=f"{kind} {ear}", ear=ear, kind=kind, stimulus="", masking_signal="",
+                                  material=0, points=points)
+        else:
+            curve = p.ToneCurve(name=f"{kind} {ear}", ear=ear, kind=kind, stimulus="", masking_signal="",
+                                pulsed=False, points=points)
+        shown[section][row] = Placed(kind, ear, curve, placed.part if placed else None)
+        if section == SPEECH:
+            shown_numbers[row] = tuple(keys)
+    return shown, shown_numbers
+
+
+def correction_to_dict(correction: Correction) -> dict:
+    entry = {"at": correction.at, "section": correction.section, "ear": correction.ear, "kind": correction.kind}
+    if correction.section in _TONE_LIKE:
+        entry["frequency_hz"] = correction.key
+    elif correction.section == SPEECH:
+        entry["point"] = correction.key
+    entry["device_value"] = value_to_dict(correction.section, correction.device)
+    entry["value"] = value_to_dict(correction.section, correction.value)
+    return entry
+
+
+def correction_from_dict(entry: dict) -> Correction:
+    """Reads back ``correction_to_dict``. Raises ValueError when it cannot be read."""
+    try:
+        section = str(entry["section"])
+        key = (int(entry["frequency_hz"]) if section in _TONE_LIKE else
+               int(entry["point"]) if section == SPEECH else 0)
+        value = _value_from_dict(section, key, entry.get("value"))
+        return _checked(Correction(section, str(entry["ear"]), str(entry["kind"]), key, value,
+                                   at=str(entry.get("at") or "")))
+    except (KeyError, TypeError, AttributeError, ValueError) as error:
+        raise ValueError(f"손으로 고친 값을 읽지 못했습니다 ({error})") from None
+
+
+def _value_from_dict(section: str, key: int, saved):
+    if saved is None:
+        return None
+    if section in _TONE_LIKE:
+        return p.TonePoint(key, int(saved["level_db_hl"]), _optional(saved.get("masking_db")),
+                           bool(saved.get("masked")), bool(saved.get("no_response")))
+    if section == SPEECH:
+        return TypedSpeechPoint(int(saved["level_db_hl"]), _optional(saved.get("score_percent")),
+                                _optional(saved.get("masking_db")), bool(saved.get("masked")),
+                                _optional(saved.get("correct")), given_words=_optional(saved.get("words")))
+    if isinstance(saved, bool) or not isinstance(saved, int):
+        raise ValueError("SRT 는 정수여야 합니다")
+    return saved
+
+
+def _optional(value) -> int | None:
+    return None if value is None else int(value)
+
+
 # --- the saved record ---------------------------------------------------------------------------
 
 def record(result: HearingResult) -> dict:
-    """The hearing part of the saved JSON: every value decoded, and the packets themselves."""
+    """The hearing part of the saved JSON: every value as the sheet shows it, each value put in by
+    hand marked with what the device sent, the corrections themselves, and the packets."""
     patients = list(result.device_patients)
     patient_index = {patient.raw: number for number, patient in enumerate(patients)}
     serials = result.serials
+    corrected = {correction.cell: correction for correction in result.corrections}
     return {
-        "device": {"maker": "MRS", "name": "Resonance", "model": serials[0][:4], "serial": serials[0],
-                   "serials": list(serials)},
+        "source": MANUAL if result.manual else DEVICE,
+        "device": ({"maker": "MRS", "name": "Resonance", "model": serials[0][:4], "serial": serials[0],
+                    "serials": list(serials)} if serials else None),
         "device_patients": [_device_patient(patient) for patient in patients],
         "tests": [_test(index, part, patient_index) for index, part in enumerate(result.parts)],
-        "tone": _tone(result) if result.tone else None,
-        "speech": _speech(result) if result.speech or result.srt else None,
-        "high_frequency": ({"curves": [_tone_curve(placed) for placed in _ordered(result.high_frequency)]}
+        "tone": _tone(result, corrected) if result.tone else None,
+        "speech": _speech(result, corrected) if result.speech or result.srt else None,
+        "high_frequency": ({"curves": [_tone_curve(placed, HIGH_FREQUENCY, corrected)
+                                       for placed in _ordered(result.high_frequency)]}
                            if result.high_frequency else None),
+        "corrections": [correction_to_dict(correction) for correction in result.corrections],
     }
 
 
 def from_saved(raw: bytes, saved: dict) -> HearingResult:
     """Reads a result back from its raw packets (the .bin) and its record (the .json).
 
-    The packets hold every value; the record adds only what the operator decided, which of
-    the tests were done with hearing aids. Raises ValueError when the packets cannot be read.
+    The packets hold every value the device sent; the record adds what the operator decided:
+    which of the tests were done with hearing aids, and the values put in by hand, which are
+    made again over the packets. A result typed in by hand has no packets. Raises ValueError
+    when the packets or the corrections cannot be read.
     """
+    manual = saved.get("source") == MANUAL
+    entries = saved.get("corrections") or []
+    if not isinstance(entries, list):
+        raise ValueError("손으로 고친 값을 읽지 못했습니다")
+    corrections = tuple(correction_from_dict(entry) for entry in entries)
+    if manual:
+        return HearingResult((), corrections, manual=True)
     aided = {str(test.get("fingerprint")) for test in saved.get("tests") or [] if isinstance(test, dict)
              and test.get("aided")}
     decoder = p.StreamDecoder()
@@ -277,7 +574,7 @@ def from_saved(raw: bytes, saved: dict) -> HearingResult:
             parts.append(Part(event, current, fingerprint(event) in aided))
     if not parts:
         raise ValueError("청력검사 원본 자료에 검사가 없습니다")
-    return HearingResult(tuple(parts))
+    return HearingResult(tuple(parts), corrections)
 
 
 def device_birth_date(patient: p.DevicePatient | None) -> date | None:
@@ -324,24 +621,57 @@ def _rank(kind: str) -> int:
     return _ORDER.index(kind) if kind in _ORDER else len(_ORDER)
 
 
-def _tone_curve(placed: Placed) -> dict:
+def _marked(entry: dict, correction: Correction | None) -> dict:
+    """A value as printed, with what the device sent when it was put in by hand."""
+    if correction is not None:
+        entry.update(corrected=True, device_value=value_to_dict(correction.section, correction.device))
+    return entry
+
+
+def _row_marks(entry: dict, section: str, placed, corrected: dict, point_of) -> dict:
+    """Marks a curve with a value put in by hand, and lists the device's values that were taken off it."""
+    changes = [correction for cell, correction in corrected.items()
+               if cell[:3] == (section, placed.ear, placed.kind)]
+    if changes:
+        entry["corrected"] = True
+    removed = [point_of(change) for change in changes if change.value is None and change.device is not None]
+    if removed:
+        entry["removed_points"] = removed
+    return entry
+
+
+def _tone_curve(placed: Placed, section: str, corrected: dict) -> dict:
     curve = placed.curve
-    return {
-        "ear": placed.ear, "kind": placed.kind, "device_kind": curve.kind, "test": placed.part,
-        "stimulus": curve.stimulus, "masking_signal": curve.masking_signal, "pulsed": curve.pulsed,
-        "points": [{"frequency_hz": point.frequency, "level_db_hl": point.level, "masking_db": point.masking,
-                    "masked": point.masked, "no_response": point.no_response} for point in curve.points],
+    by_hand = placed.part is None
+    points = [_marked({"frequency_hz": point.frequency, "level_db_hl": point.level, "masking_db": point.masking,
+                       "masked": point.masked, "no_response": point.no_response},
+                      corrected.get((section, placed.ear, placed.kind, point.frequency)))
+              for point in curve.points]
+    entry = {
+        "ear": placed.ear, "kind": placed.kind, "device_kind": None if by_hand else curve.kind, "test": placed.part,
+        "stimulus": None if by_hand else curve.stimulus,
+        "masking_signal": None if by_hand else curve.masking_signal, "pulsed": None if by_hand else curve.pulsed,
+        "points": points,
     }
+    return _row_marks(entry, section, placed, corrected,
+                      lambda change: dict(frequency_hz=change.key, **value_to_dict(section, change.device)))
 
 
-def _tone(result: HearingResult) -> dict:
+def _tone(result: HearingResult, corrected: dict) -> dict:
     averages = []
     for placed in _ordered(result.tone):
         if placed.kind not in AVERAGED:
             continue
+        changed = any(cell[:3] == (TONE, placed.ear, placed.kind) for cell in corrected)
+        sent = result.device_curve(TONE, placed.kind, placed.ear)
         for method in METHODS:
-            averages.append(dict(ear=placed.ear, kind=placed.kind, **_average(average(placed.curve, method))))
-    return {"curves": [_tone_curve(placed) for placed in _ordered(result.tone)], "averages": averages}
+            entry = dict(ear=placed.ear, kind=placed.kind, **_average(average(placed.curve, method)))
+            if changed:
+                before = average(sent, method)
+                entry.update(corrected=True, device_value=None if sent is None else _average(before))
+            averages.append(entry)
+    return {"curves": [_tone_curve(placed, TONE, corrected) for placed in _ordered(result.tone)],
+            "averages": averages}
 
 
 def _average(value: Average) -> dict:
@@ -357,19 +687,26 @@ def _speech_point(point: p.SpeechPoint) -> dict:
             "masked": point.masked, "correct": point.correct, "words": point.words}
 
 
-def _speech(result: HearingResult) -> dict:
+def _speech(result: HearingResult, corrected: dict) -> dict:
     curves = []
     for placed in _ordered(result.speech):
         curve = placed.curve
         best = curve.best
-        curves.append({
-            "ear": placed.ear, "kind": placed.kind, "device_kind": curve.kind, "test": placed.part,
-            "stimulus": curve.stimulus, "masking_signal": curve.masking_signal, "material": curve.material,
-            "points": [_speech_point(point) for point in curve.points],
+        by_hand = placed.part is None
+        numbers = result.speech_numbers(placed.kind, placed.ear)
+        entry = {
+            "ear": placed.ear, "kind": placed.kind, "device_kind": None if by_hand else curve.kind, "test": placed.part,
+            "stimulus": None if by_hand else curve.stimulus,
+            "masking_signal": None if by_hand else curve.masking_signal,
+            "material": None if by_hand else curve.material,
+            "points": [_marked(_speech_point(point), corrected.get((SPEECH, placed.ear, placed.kind, number)))
+                       for number, point in zip(numbers, curve.points)],
             "best": _speech_point(best) if best is not None else None,
             "srt_db_hl": result.srt_of(placed.kind, placed.ear),
-        })
-    srt = [{"ear": entry.ear, "kind": entry.kind, "device_kind": entry.device_kind, "test": entry.part,
-            "level_db_hl": entry.level}
+        }
+        curves.append(_row_marks(entry, SPEECH, placed, corrected,
+                                 lambda change: dict(point=change.key, **value_to_dict(SPEECH, change.device))))
+    srt = [_marked({"ear": entry.ear, "kind": entry.kind, "device_kind": entry.device_kind, "test": entry.part,
+                    "level_db_hl": entry.level}, corrected.get((SRT, entry.ear, entry.kind, 0)))
            for entry in sorted(result.srt.values(), key=lambda entry: (entry.ear != "R", _rank(entry.kind)))]
     return {"curves": curves, "srt": srt}
