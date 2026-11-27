@@ -43,7 +43,9 @@ def names(folder):
 
 def test_newest_release_is_found_by_following_the_latest_address(site):
     assert update.latest_release(site.url) == Release("99.0.0", f"{site.url}/download/v99.0.0/TSM300.exe")
-    assert site.requests == [("HEAD", "/releases/latest"), ("HEAD", "/releases/tag/v99.0.0")]
+    # Whether the request that follows the redirect is still a HEAD depends on the Python version.
+    assert site.requests[0] == ("HEAD", "/releases/latest")
+    assert [path for _, path in site.requests] == ["/releases/latest", "/releases/tag/v99.0.0"]
 
 
 def test_a_page_without_releases_and_a_page_out_of_reach_are_said_plainly():
