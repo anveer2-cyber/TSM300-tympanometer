@@ -576,6 +576,10 @@ PING = 0x05
 ACK = 0x06
 NACK = 0x07
 READ_ONLY = frozenset({SYNC, GET_ALL, DEVICE_INFO, PING, ACK, NACK})
+USB_TEST_ACK = NACK
+"""What the maker's program sends over USB to say a test arrived: 0x07, not 0x06.
+It sends it after a test that came with no device patient before it, and after a test the
+device sent unasked; 통신_절차.md §5."""
 
 
 def command(number: int, *args: int, length_field: int = 0x0A) -> bytes:

@@ -467,7 +467,8 @@ class SettingsDialog(QDialog):
             folder = Path(os.path.abspath(results)) / hearing_device.LOG_FOLDER
         opener = self._hearing_opener(edited.hearing_link)
         self.hearing_test_button.setEnabled(False)
-        self.hearing_result.setText("청력검사기에 묻는 중...")
+        self.hearing_result.setText(f"청력검사기에 묻는 중... 장비에서 [{hearing_device.CONNECT_KEY}]를 눌러 주세요 "
+                                    f"(최대 {hearing_device.DEVICE_WAIT:.0f}초 기다림)")
 
         def done(result, error) -> None:
             self.hearing_test_button.setEnabled(True)
@@ -907,6 +908,8 @@ class MainWindow(QMainWindow):
         self._run_editor = run_editor or (lambda dialog: dialog.exec())
         self._receiving = False
         self._hearing_progress = 0
+        self._hearing_waiting = 0
+        """Seconds left to wait for the audiometer to answer: the operator may still have to press Connect to PC."""
         self._hearing_text = ""
         self._no_wheel = NoWheel(self)
         self.setWindowTitle(f"TSM-300 임피던스 청력검사 v{__version__}")
@@ -1919,13 +1922,16 @@ class MainWindow(QMainWindow):
             return
         opener = self._hearing_opener(self._settings.hearing_link)
         log_folder = self._directory / hearing_device.LOG_FOLDER if self._settings.hearing_log else None
-        self._receiving, self._hearing_progress = True, 0
+        self._receiving, self._hearing_progress, self._hearing_waiting = True, 0, 0
         self._hearing_text = "청력검사기에서 받는 중입니다..."
         self._hearing_timer.start()
         self._show_hearing()
 
         def note_progress(count: int) -> None:  # called on the receiving thread
             self._hearing_progress = count
+
+        def note_waiting(left: int) -> None:  # called on the receiving thread
+            self._hearing_waiting = left
 
         def done(fetched, error) -> None:
             self._receiving = False
@@ -1936,7 +1942,7 @@ class MainWindow(QMainWindow):
                 return
             self._hearing_fetched(fetched)
 
-        self._background(self, lambda: self._fetch_hearing(opener, log_folder, note_progress), done)
+        self._background(self, lambda: self._fetch_hearing(opener, log_folder, note_progress, waiting=note_waiting), done)
 
     def _hearing_fetched(self, fetched) -> None:
         """Lets the operator choose the tests of the patient in the window, and saves them as one sheet."""
@@ -2069,6 +2075,8 @@ class MainWindow(QMainWindow):
         text = self._hearing_text
         if self._receiving and self._hearing_progress:
             text = f"청력검사기에서 받는 중입니다... 검사 {self._hearing_progress}건"
+        elif self._receiving and self._hearing_waiting:
+            text = hearing_device.WAITING.format(left=self._hearing_waiting)
         if not self._settings.hearing_on and not self._receiving:
             text = ""
         self.hearing_label.setText(text)

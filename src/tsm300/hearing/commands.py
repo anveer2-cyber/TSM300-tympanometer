@@ -38,14 +38,15 @@ def check(args, console: Console) -> int:
         for path in paths:
             console.say(f"  {path}")
         if not paths:
-            console.say("※ 청력검사기를 찾지 못했습니다. 기기 전원, USB 선, MRS 드라이버 설치를 확인해 주세요.")
-            return 1
+            console.say(f"※ 지금은 청력검사기가 USB 에 보이지 않습니다. 장비에서 [{device.CONNECT_KEY}]를 눌러 주세요. "
+                        f"{device.DEVICE_WAIT:.0f}초 동안 기다립니다.")
     folder = Path(args.out) if args.out else log_folder()
     opener = device.opener_for(device.SIMULATOR if args.simulator else device.USB)
     live = getattr(sys.stdout, "isatty", lambda: False)()  # no running count in a file the output is sent to
     try:
-        fetched = device.fetch(opener, folder, progress=(lambda count: console.status(f"받는 중... 검사 {count}건"))
-                               if live else None)
+        fetched = device.fetch(opener, folder,
+                               progress=(lambda count: console.status(f"받는 중... 검사 {count}건")) if live else None,
+                               waiting=(lambda left: console.status(device.WAITING.format(left=left))) if live else None)
     except device.DeviceError as error:
         if live:
             console.clear_status()

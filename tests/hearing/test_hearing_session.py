@@ -100,8 +100,8 @@ def test_a_test_sent_unasked_is_not_lost():
     session, device, _ = session_with(Behaviour(unasked_test=True))
     session.identify()
     result = session.download()
-    assert len(result.tests) == 6  # the pushed copy and the memory's own
-    assert len({fingerprint(t) for t in result.tests}) == 5
+    assert len(result.tests) == 5  # the pushed copy and the memory's own are kept once
+    assert len({fingerprint(t) for t in result.tests}) == 5 and result.repeats == 1
 
 
 def test_empty_memory():

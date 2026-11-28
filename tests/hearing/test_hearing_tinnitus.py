@@ -367,8 +367,8 @@ def open_window(qapp, results, settings=HEARING, steps=(), **options):
     options.setdefault("settings_directory", results.parent / "settings")
     window = MainWindow(results, settings, now=lambda: WHEN, run_editor=staff, choose_hearing=choose,
                         hearing_opener=lambda link: audiometer.open,
-                        fetch_hearing=lambda opener, folder, progress: device.fetch(
-                            opener, folder, progress, now=lambda: WHEN, clock=audiometer.clock), **options)
+                        fetch_hearing=lambda opener, folder, progress, **kw: device.fetch(
+                            opener, folder, progress, now=lambda: WHEN, clock=audiometer.clock, **kw), **options)
     window.show()
     assert QTest.qWaitForWindowExposed(window)
     _OPENED.append(window)

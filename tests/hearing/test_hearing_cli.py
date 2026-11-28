@@ -25,8 +25,15 @@ def test_hearing_check_reads_the_simulated_device_and_keeps_the_byte_log(tmp_pat
 def test_hearing_check_without_a_device_says_what_to_check(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)  # the byte log goes in the results folder, here the usual one beside the program
     monkeypatch.setattr(device, "usb_devices", lambda: [])
+    monkeypatch.setattr(device, "DEVICE_WAIT", 0.0)  # the operator never presses Connect to PC
+
+    def missing():
+        raise device.DeviceMissing(device.NO_DEVICE)
+
+    monkeypatch.setattr(device, "opener_for", lambda link: missing)
     assert cli.main(["hearing-check"]) == 1
-    assert "청력검사기를 찾지 못했습니다" in capsys.readouterr().out
+    said = capsys.readouterr().out
+    assert "USB 에 보이지 않습니다. 장비에서 [Connect to PC]를 눌러 주세요" in said and device.NO_DEVICE in said
 
     def busy():
         raise device.DeviceError("청력검사기를 다른 프로그램이 쓰고 있습니다. MDS 가 켜져 있으면 닫아 주세요.")
@@ -37,8 +44,8 @@ def test_hearing_check_without_a_device_says_what_to_check(tmp_path, monkeypatch
     assert cli.main(["hearing-check"]) == 1
     said = capsys.readouterr().out
     assert "1대" in said and "MDS 가 켜져 있으면 닫아 주세요" in said
-    (log,) = (tmp_path / "results" / device.LOG_FOLDER).glob("*.txt")
-    assert f"주고받은 기록: {log.resolve()}" in said
+    logs = list((tmp_path / "results" / device.LOG_FOLDER).glob("*.txt"))  # one from each try
+    assert len(logs) == 2 and any(f"주고받은 기록: {log.resolve()}" in said for log in logs)
 
 
 def test_hearing_demo_draws_a_sample_sheet(tmp_path, capsys):

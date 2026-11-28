@@ -19,7 +19,7 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from fakes import KEY, CaptureReceiver  # noqa: E402
-from hearing_fakes import Audiometer, Clock, Silent, Unplugged  # noqa: E402
+from hearing_fakes import Audiometer, Bench, Clock, Silent, Unplugged  # noqa: E402
 from tsm300 import app as app_module  # noqa: E402
 from tsm300.app import HEARING_LABEL, HearingReceiveDialog, MainWindow, SettingsDialog, run_in_background  # noqa: E402
 from tsm300.hearing import device  # noqa: E402
@@ -124,8 +124,8 @@ def open_window(qapp, results, audiometer=None, operator=None, settings=HEARING,
     options.setdefault("confirm_patient", lambda patient: True)
     options.setdefault("settings_directory", results.parent / "settings")
     options.setdefault("hearing_opener", lambda link: audiometer.open)
-    options.setdefault("fetch_hearing", lambda opener, folder, progress: device.fetch(
-        opener, folder, progress, now=lambda: WHEN, clock=audiometer.clock))
+    options.setdefault("fetch_hearing", lambda opener, folder, progress, **kw: device.fetch(
+        opener, folder, progress, now=lambda: WHEN, clock=audiometer.clock, **kw))
     window = MainWindow(results, settings, now=lambda: WHEN,
                         choose_hearing=lambda *args: operator(window, *args), **options)
     window.show()
@@ -184,6 +184,28 @@ def test_the_newest_device_patients_new_tests_become_one_sheet_for_the_patient_i
     assert not window.preview.pixmap().isNull()
     assert len(seen(results)) == 4
     assert window.hearing_button.isEnabled()
+
+
+def test_while_the_audiometer_waits_for_connect_to_pc_the_window_says_what_to_press(qapp, results):
+    bench = Bench(Behaviour(needs_button=True), press_at=6.0)
+    shown = []
+
+    def fetch(opener, folder, progress, waiting=None):
+        def told(left):
+            waiting(left)
+            window._show_hearing()
+            shown.append(window.hearing_label.text())
+        return device.fetch(bench.open, folder, progress, now=lambda: WHEN, clock=bench.clock,
+                            sleep=bench.sleep, waiting=told)
+
+    window = open_window(qapp, results, fetch_hearing=fetch)
+    window.set_patient(KIM)
+    window.hearing_button.click()
+
+    assert shown and shown[0] == device.WAITING.format(left=29)
+    assert all("장비에서 [Connect to PC]를 눌러 주세요" in text for text in shown)
+    assert f"{STEM}_12345.json" in saved(results)
+    assert "검사 4건으로 결과지를 만들었습니다" in window.hearing_label.text()
 
 
 def test_a_second_reading_offers_only_the_tests_not_saved_yet(qapp, results):
@@ -327,7 +349,7 @@ def test_no_device_or_one_held_by_another_program_is_explained(qapp, results, me
 def test_a_device_that_does_not_answer_is_explained(qapp, results):
     clock = Clock()
     window = open_window(qapp, results, hearing_opener=lambda link: lambda: Silent(clock),
-                         fetch_hearing=lambda opener, folder, progress: device.fetch(opener, folder, progress, clock=clock))
+                         fetch_hearing=lambda opener, folder, progress, **kw: device.fetch(opener, folder, progress, clock=clock, **kw))
     window.hearing_button.click()
     assert device.NO_ANSWER in window.hearing_label.text()
     assert saved(results) == []
@@ -514,7 +536,7 @@ def test_settings_dialog_has_the_audiometer_tab_and_tries_the_connection(qapp, r
 
     assert dialog.hearing_result.text() == f"✔ 연결됨: MRS Resonance R37A (일련번호 {DEMO_SERIAL})"
     assert opened == [device.SIMULATOR]
-    assert [command[4] for command in audiometer.sent()] == [0x16, 0x07]
+    assert [command[4] for command in audiometer.sent()] == [0x16]  # who it is, and nothing more
     assert list((results / device.LOG_FOLDER).glob("*.txt"))
 
 

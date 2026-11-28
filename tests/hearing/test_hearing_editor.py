@@ -106,8 +106,8 @@ def open_window(qapp, results, settings=HEARING, **options):
     options.setdefault("confirm_patient", lambda patient: True)
     options.setdefault("settings_directory", results.parent / "settings")
     options.setdefault("hearing_opener", lambda link: audiometer.open)
-    options.setdefault("fetch_hearing", lambda opener, folder, progress: device.fetch(
-        opener, folder, progress, now=lambda: WHEN, clock=audiometer.clock))
+    options.setdefault("fetch_hearing", lambda opener, folder, progress, **kw: device.fetch(
+        opener, folder, progress, now=lambda: WHEN, clock=audiometer.clock, **kw))
     window = MainWindow(results, settings, now=lambda: WHEN, run_editor=staff,
                         choose_hearing=lambda *args: choose_practice(window, *args), **options)
     window.show()

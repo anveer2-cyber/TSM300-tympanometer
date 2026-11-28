@@ -3,7 +3,9 @@
 It answers the way docs/hearing/통신_절차.md says the device does: the identification with its serial
 number (``KI``) or an ack, "get all" with every patient (``KA``) and test (``KT``) in its
 memory followed by an ack. Variants of that behaviour can be switched on to make sure the
-program copes with what a real device might do differently.
+program copes with what a real device might do differently: one that says nothing until
+Connect to PC is pressed on it (``press``), one that then sends its tests by itself, and one
+that sends the next test only once the PC has answered the last with KC 07.
 
     python -m tsm300.hearing.simulator --port 50555        # serve it on TCP for another program
 """
@@ -31,6 +33,13 @@ class Behaviour:
     """Sends the newest test as soon as it is identified, as old firmware did."""
     ignore_length_field: bool = True
     """False: refuses commands whose length field is not 0x0A or 0x10."""
+    needs_button: bool = False
+    """Takes no notice of the PC until ``press()``, the operator pressing Connect to PC."""
+    pushes: bool = False
+    """On ``press()``, sends every test it holds by itself, and never answers the identification
+    (the maker's old firmware path)."""
+    waits_for_ack: bool = False
+    """Sends the next test only after the PC's KC 07 for the last one."""
 
 
 @dataclass
@@ -44,6 +53,10 @@ class Memory:
         data = f"{number};{pc_number};{first};{surname};{birth};{sex};;;".encode("utf-8")
         self.groups.append((p.frame(p.KIND_PATIENT, data), list(tests)))
 
+    def add_without_patient(self, tests: list[bytes]) -> None:
+        """Tests kept with no patient, as on an audiometer that shows its curves until switched off."""
+        self.groups.append((b"", list(tests)))
+
 
 class SimulatedAudiometer:
     """Plays the device's side of the link: ``write`` takes the PC's bytes, ``read`` gives answers."""
@@ -55,10 +68,25 @@ class SimulatedAudiometer:
         self.behaviour = behaviour or Behaviour()
         self.received: list[bytes] = []
         self.refused: list[bytes] = []
+        self.test_acks = 0
+        """KC 07s the PC sent (its answer to a test, and its goodbye)."""
         self._outgoing = bytearray(self.behaviour.noise_before)
         self._incoming = bytearray()
+        self._waiting: list[bytes] = []
+        """Packets held back until the PC answers the last test (``waits_for_ack``)."""
         self._identified = False
+        self.ready = not (self.behaviour.needs_button or self.behaviour.pushes)
         self.closed = False
+
+    def press(self) -> None:
+        """The operator presses Connect to PC on the device. One that sends its tests by itself
+        starts over each time, from the first."""
+        if self.ready and not self.behaviour.pushes:
+            return
+        self.ready = True
+        if self.behaviour.pushes:
+            self._waiting = []
+            self._send([test for _, tests in self.memory.groups for test in tests])
 
     # --- the link, seen from the PC ------------------------------------------------------
 
@@ -83,8 +111,22 @@ class SimulatedAudiometer:
         body = bytes([p.ACK, value]).ljust(10, b"\x00")
         return bytes([p.START, p.KIND_COMMAND, 0, 10]) + body + bytes([p.xor(body), p.END])
 
+    def _send(self, packets: list[bytes]) -> None:
+        """Hands packets over, one test at a time if the PC must answer each test first."""
+        self._waiting += packets
+        self._release()
+
+    def _release(self) -> None:
+        while self._waiting:
+            packet = self._waiting.pop(0)
+            self._outgoing += packet
+            if self.behaviour.waits_for_ack and packet[1] in (p.KIND_TEST, p.KIND_TEST_R1):
+                return
+
     def _handle(self, command: bytes) -> None:
         self.received.append(command)
+        if not self.ready:
+            return
         if command[:2] != b"KC" or command[-1] != p.END or p.xor(command[4:14]) != command[14]:
             self.refused.append(command)
             self._outgoing += p.frame(p.KIND_COMMAND, bytes([p.NACK]).ljust(10, b"\x00"))
@@ -93,7 +135,9 @@ class SimulatedAudiometer:
             self.refused.append(command)
             return
         number = command[4]
-        if number == p.SYNC:
+        if number == p.SYNC and self.behaviour.pushes:
+            pass  # the old firmware path: it sends, it does not answer
+        elif number == p.SYNC:
             answer = self.behaviour.answer_identification
             if "KI" in answer and not self._identified:
                 self._outgoing += p.frame(p.KIND_IDENTIFICATION, self.memory.serial.encode("ascii") + b"\x00")
@@ -103,15 +147,18 @@ class SimulatedAudiometer:
                 self._outgoing += self.memory.groups[-1][1][-1]
             self._identified = True
         elif number == p.GET_ALL:
+            packets = []
             for patient, tests in self.memory.groups:
-                self._outgoing += patient
-                for test in tests:
-                    self._outgoing += test
+                packets += ([patient] if patient else []) + list(tests)
             if self.behaviour.ack_at_end:
-                self._outgoing += self._ack()
+                packets.append(self._ack())
+            self._send(packets)
         elif number == p.PING:
             self._outgoing += self._ack()
-        elif number in (p.ACK, p.NACK, p.DEVICE_INFO):
+        elif number == p.USB_TEST_ACK:
+            self.test_acks += 1
+            self._release()
+        elif number in (p.ACK, p.DEVICE_INFO):
             pass
         else:
             self.refused.append(command)

@@ -40,7 +40,8 @@ def test_only_commands_that_read_are_sent():
 
     sent = audiometer.sent()
     assert {command[4] for command in sent} <= p.READ_ONLY
-    assert [command[4] for command in sent] == [p.SYNC, p.SYNC, p.GET_ALL, p.NACK, p.SYNC, p.NACK]
+    # the check closes without the goodbye: over USB that KC 07 would also answer a test
+    assert [command[4] for command in sent] == [p.SYNC, p.SYNC, p.GET_ALL, p.NACK, p.SYNC]
     assert not any(device_.refused for device_ in audiometer.devices)
     assert all(device_.closed for device_ in audiometer.devices)
 

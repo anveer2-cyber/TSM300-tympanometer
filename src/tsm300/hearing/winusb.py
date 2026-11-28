@@ -40,6 +40,10 @@ class WinUsbError(RuntimeError):
     pass
 
 
+class NoAudiometer(WinUsbError):
+    """Windows sees no audiometer on USB (it may appear once Connect to PC is pressed on it)."""
+
+
 class GUID(ctypes.Structure):
     _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16), ("Data3", ctypes.c_uint16),
                 ("Data4", ctypes.c_ubyte * 8)]
@@ -225,7 +229,7 @@ def open_audiometer() -> WinUsbLink:
     """The first Resonance audiometer on USB."""
     paths = device_paths()
     if not paths:
-        raise WinUsbError("USB 에 연결된 청력검사기가 없습니다. 선과 전원, 그리고 MRS 드라이버 설치를 확인해 주세요")
+        raise NoAudiometer("USB 에 연결된 청력검사기가 없습니다. 선과 전원, 그리고 MRS 드라이버 설치를 확인해 주세요")
     return WinUsbLink(paths[0])
 
 

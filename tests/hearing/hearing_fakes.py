@@ -85,3 +85,54 @@ class Audiometer:
 
     def sent(self) -> list[bytes]:
         return [command for device in self.devices for command in device.received]
+
+
+class Bench:
+    """One simulated audiometer on the desk, with its clock and an operator who presses Connect to
+    PC on it ``press_at`` seconds after [받기] (0: before, None: never). ``on_usb`` False: Windows
+    sees the device only once it has been pressed."""
+
+    def __init__(self, behaviour: Behaviour, memory=None, press_at: float | None = 0.0, on_usb: bool = True) -> None:
+        self.clock = Clock()
+        self.device = SimulatedAudiometer(memory or practice_memory(), behaviour)
+        self.press_at, self.on_usb = press_at, on_usb
+        self.waited: list[int] = []
+        self.opened = 0
+        self._tick()
+
+    def _tick(self) -> None:
+        if self.press_at is not None and self.clock.now >= self.press_at:
+            self.press_at = None  # pressed once
+            self.device.press()
+
+    def open(self):
+        from tsm300.hearing import device
+        self._tick()
+        if not self.on_usb and not self.device.ready:
+            raise device.DeviceMissing(device.NO_DEVICE)
+        self.opened += 1
+        return BenchLink(self)
+
+    def sleep(self, seconds: float) -> None:
+        self.clock.now += seconds
+        self._tick()
+
+    def fetch(self, **options):
+        from tsm300.hearing import device
+        return device.fetch(self.open, clock=self.clock, sleep=self.sleep, waiting=self.waited.append, **options)
+
+    def check(self, **options):
+        from tsm300.hearing import device
+        return device.check(self.open, clock=self.clock, sleep=self.sleep, waiting=self.waited.append, **options)
+
+
+class BenchLink(Timed):
+    name = "모의 장비 (시험대)"
+
+    def __init__(self, bench: Bench) -> None:
+        super().__init__(bench.device, bench.clock)
+        self.bench = bench
+
+    def read(self) -> bytes:
+        self.bench._tick()
+        return super().read()
