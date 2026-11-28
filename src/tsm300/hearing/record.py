@@ -1,7 +1,7 @@
 """One hearing result: the tests received from the audiometer that the operator put on one sheet.
 
 The audiometer sends each test on its own, without the patient or the date (see
-docs/hearing/통신_절차.md §6.5). The operator chooses which of the received tests belong to the
+docs/hearing/통신_절차.md §4.2). The operator chooses which of the received tests belong to the
 patient in the program, and they become one ``HearingResult``: a pure tone test, a speech test
 and a high-frequency test, each at most once per ear and transducer. A test that holds only
 soundfield curves may be marked as done with hearing aids; its soundfield curves then go on the

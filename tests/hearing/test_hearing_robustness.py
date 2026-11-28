@@ -1,6 +1,6 @@
 """Whatever the USB link brings, the decoder neither stops for good nor loses good packets.
 
-The maker's program stalls on several of these (docs/hearing/통신_절차.md §3.4): one byte of
+The maker's program stalls on several of these (docs/hearing/통신_절차.md §3.3): one byte of
 noise before a packet, a packet with no length (KJ), a short live-tone packet at the end.
 """
 

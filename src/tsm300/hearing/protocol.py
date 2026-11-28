@@ -1,7 +1,7 @@
 """Decoding of what MRS Resonance audiometers (R17A, R27A, R37A, R35C ...) send to a PC.
 
-Written from the rules in docs/hearing/통신_절차.md and 결과_구조.md, which were worked out from
-the maker's PC program (MDS 3.03) and checked against the sample packets it ships with.
+Written from what was worked out from the maker's PC program (MDS 3.03) to work with its devices,
+and checked against the sample packets it ships with. docs/hearing/통신_절차.md sums it up.
 
 Every packet has the same frame:
 
@@ -453,7 +453,7 @@ def _speech(packet: Packet, body: bytes) -> SpeechAudiogram:
 # --- the byte stream -----------------------------------------------------------------------
 
 KNOWN_KINDS = frozenset(b"TtCAIQfJdWL MpqrS") | frozenset(FIXED_SIZES)
-"""Every packet kind the maker's program knows (docs/hearing/통신_절차.md §6.1)."""
+"""Every packet kind the maker's program knows (docs/hearing/통신_절차.md §4.1)."""
 MAX_DATA = {KIND_TEST: 16384, KIND_TEST_R1: 16384, KIND_COMMAND: 64}
 MAX_OTHER_DATA = 8192
 """The largest data a packet of each kind may claim. A tympanogram, the largest, is about 8 kB."""
@@ -567,7 +567,7 @@ class StreamDecoder:
 
 # --- commands the PC may send --------------------------------------------------------------
 # Only commands that read. Never send delete (0x03), serial-number, calibration, stimulus
-# or patient-upload commands from this program (docs/hearing/통신_절차.md §8.1).
+# or patient-upload commands from this program (docs/hearing/통신_절차.md §6).
 
 SYNC = 0x16
 GET_ALL = 0x01
@@ -579,7 +579,7 @@ READ_ONLY = frozenset({SYNC, GET_ALL, DEVICE_INFO, PING, ACK, NACK})
 USB_TEST_ACK = NACK
 """What the maker's program sends over USB to say a test arrived: 0x07, not 0x06.
 It sends it after a test that came with no device patient before it, and after a test the
-device sent unasked; 통신_절차.md §5."""
+device sent unasked; docs/hearing/통신_절차.md §5.3."""
 
 
 def command(number: int, *args: int, length_field: int = 0x0A) -> bytes:

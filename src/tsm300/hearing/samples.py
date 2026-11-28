@@ -1,4 +1,4 @@
-"""Builds Resonance result packets, following the layout in docs/hearing/통신_절차.md and 결과_구조.md.
+"""Builds Resonance result packets, following the layout protocol.py reads.
 
 Used by the tests, by the simulator and by the cross-check against the maker's program.
 Every number here is made up; none belongs to a patient.
