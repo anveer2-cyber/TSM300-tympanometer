@@ -148,3 +148,13 @@ def test_a_device_that_answers_with_an_ack_only_is_not_kept_waiting():
     fetched = bench.fetch()
 
     assert len(fetched.download.tests) == 3 and bench.waited == [] and bench.clock.now < 10
+
+
+def test_hearing_check_says_when_the_device_sent_its_tests_by_itself():
+    from tsm300.hearing.commands import summary
+
+    bench = Bench(Behaviour(pushes=True, waits_for_ack=True), r27a_screen())
+    lines = summary(bench.fetch())
+
+    assert "끝 신호 없음(기기가 묻기 전에 스스로 보냄)" in lines[1]
+    assert all("—" not in line for line in lines)  # a Korean Windows console would write '?'

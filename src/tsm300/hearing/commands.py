@@ -70,7 +70,10 @@ def summary(fetched: device.Fetched) -> list[str]:
     download = fetched.download
     lines = [f"일련번호: {download.serial or '알려 주지 않음'}",
              f"기기 환자 {len(download.groups)}명, 검사 {len(download.tests)}건, "
-             f"끝 신호 {'받음' if download.finished else '못 받음'}, 알아보지 못한 조각 {len(download.corrupt)}개"]
+             + ("끝 신호 없음(기기가 묻기 전에 스스로 보냄)" if download.pushed
+                else f"끝 신호 {'받음' if download.finished else '못 받음'}")
+             + f", 알아보지 못한 조각 {len(download.corrupt)}개"
+             + (f", 두 번 온 검사 {download.repeats}건은 하나만" if download.repeats else "")]
     lines += [f"※ {warning}" for warning in fetched.warnings]
     order = 0
     for group in download.groups:
@@ -82,7 +85,8 @@ def summary(fetched: device.Fetched) -> list[str]:
         for test in group.tests:
             order += 1
             mark = " (보청기 착용 표시 가능: 음장만 있음)" if can_be_aided(test) else ""
-            lines.append(f"  {order}. {describe(test)}{mark}")
+            # ':' rather than the dash, which a Korean Windows console writes as '?'
+            lines.append(f"  {order}. {describe(test).replace(' — ', ': ')}{mark}")
             lines += [f"     {line}" for line in _values(test)]
     lines.append("")
     lines.append(f"주고받은 기록: {fetched.log}" if fetched.log else "주고받은 기록은 남기지 않았습니다.")
